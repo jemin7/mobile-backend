@@ -1,0 +1,554 @@
+"use client";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, Suspense } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Eye, EyeOff } from "lucide-react";
+import {
+  registerPushSubscription,
+  resetPushClientStateIfNeeded,
+} from "@/lib/pushSubscribe";
+import {
+  clearEmpBadgesForVisitedPath,
+  refreshHomeScreenBadge,
+} from "@/lib/empNotificationBadge";
+import {
+  appendInAppNotification,
+  pushPayloadToInAppNotification,
+  upsertInAppNotification,
+} from "@/app/utils/empInAppNotifications";
+import { empPayoutHrefForPeriod } from "@/app/utils/empPayslipApi";
+import { EmpMarkoutReminderBanner } from "@/app/components/emp/EmpMarkoutReminderBanner";
+import { toast } from "sonner";
+import { isPasswordValid, PASSWORD_POLICY_MESSAGE } from "@/lib/passwordRules";
+import {
+  clearTemporaryLoginPassword,
+  employeeMustChangePassword,
+  readTemporaryLoginPassword,
+} from "@/lib/tempPasswordSession";
+import { PasswordRuleHints } from "@/app/components/ui/password-rule-hints";
+import { ensureFetchRefreshPatch } from "@/app/utils/patchFetchForRefresh";
+import { useEmpManagerScope } from "@/app/hooks/useEmpManagerScope";
+import { isDesktopBrowser } from "@/lib/desktopManager";
+import { resolveEmpPhoto } from "@/app/utils/empPhotoCache";
+import { getPageCache } from "@/app/utils/pageCache";
+import { setSidebarContext, getSidebarContext } from "@/app/utils/sidebarContext";
+import { hasCompanyAccessFlag } from "@/lib/companyAccess";
+import { clearClientSession } from "@/lib/auth";
+import { preloadHeroImages } from "@/app/components/emp/desktop/HeroBackground";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/app/components/ui/dialog";
+import { Button } from "@/app/components/ui/button";
+import { Input } from "@/app/components/ui/input";
+import { Label } from "@/app/components/ui/label";
+import {
+  resolveModuleWorkspace,
+  visibleModuleTabs,
+} from "./emp-portal-workspaces";
+import { EmpSidebar } from "./EmpSidebar";
+import { EmpWorkspaceTabNav } from "../emp/EmpWorkspaceTabNav";
+import { EmpMoreCategoryTabNav } from "../emp/EmpMoreCategoryTabNav";
+import { EmpSetupCategoryTabNav } from "../emp/EmpSetupCategoryTabNav";
+import { EmpPortalTopbar } from "./EmpPortalTopbar";
+import { EmpPortalPageProvider } from "./emp-portal-page-context";
+import { ListToolbarActionsProvider } from "./list-toolbar-actions-context";
+import { applyEmpTheme, readStoredEmpTheme } from "@/app/utils/empTheme";
+import {
+  findActiveSidebarItem,
+  fullPortalUrl,
+  getSidebarItemId,
+  recordPortalNavigation,
+} from "./emp-portal-nav-history";
+import { filterEmpSidebarNavigation } from "./emp-portal-sidebar-navigation";
+
+interface EmpPortalShellProps {
+  children: React.ReactNode;
+  hideBottomNav?: boolean;
+}
+
+function isLeaveReimbSubRoute(pathname: string | null): boolean {
+  if (!pathname) return false;
+  // Detail / apply routes under leave or reimbursement — no module tab bar
+  if (/^\/empLeaveApplication\/(new|[^/]+)$/.test(pathname)) return true;
+  if (/^\/empReimbursement\/(new|edit|[^/]+)$/.test(pathname)) return true;
+  return false;
+}
+
+function isRunningStandalone(): boolean {
+  if (typeof window === "undefined") return false;
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    (window.navigator as Navigator & { standalone?: boolean }).standalone === true
+  );
+}
+
+export function useEmpPortalLayout(): { desktop: boolean; ready: boolean } {
+  // Default to mobile-safe until measured — prevents desktop sidebar flash on PWA launch.
+  const [desktop, setDesktop] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useLayoutEffect(() => {
+    setDesktop(isDesktopBrowser());
+    setReady(true);
+  }, []);
+
+  useEffect(() => {
+    const check = () => setDesktop(isDesktopBrowser());
+    window.addEventListener("resize", check);
+    let mql: MediaQueryList | null = null;
+    try {
+      mql = window.matchMedia("(display-mode: standalone)");
+      mql.addEventListener?.("change", check);
+    } catch {
+      /* ignore */
+    }
+    return () => {
+      window.removeEventListener("resize", check);
+      mql?.removeEventListener?.("change", check);
+    };
+  }, []);
+
+  return { desktop, ready };
+}
+
+export function useEmpPortalDesktop(): boolean {
+  return useEmpPortalLayout().desktop;
+}
+
+export default function EmpPortalShell({ children, hideBottomNav = false }: EmpPortalShellProps) {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const { isManagerView } = useEmpManagerScope();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [empUser, setEmpUser] = useState<any>(null);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [pwdForm, setPwdForm] = useState({ oldPassword: "", newPassword: "", confirmPassword: "" });
+  const [pwdLoading, setPwdLoading] = useState(false);
+  const [showOldPwd, setShowOldPwd] = useState(false);
+  const [showNewPwd, setShowNewPwd] = useState(false);
+  const [showConfirmPwd, setShowConfirmPwd] = useState(false);
+  const syncInFlight = useRef(false);
+  const prevNavRef = useRef<{ url: string; sectionId: string } | null>(null);
+
+  const activeModule = resolveModuleWorkspace(pathname);
+
+  const moduleTabs = activeModule
+    ? visibleModuleTabs(activeModule, isManagerView)
+    : [];
+
+  // Warm the Home hero scene as soon as the portal mounts (often before Home paints).
+  useEffect(() => {
+    preloadHeroImages(false);
+  }, []);
+
+  // Track visit history so re-clicking an active sidebar item steps back (Gmail-style).
+  useEffect(() => {
+    const search = searchParams.toString();
+    const url = fullPortalUrl(pathname || "", search ? `?${search}` : "");
+    const sidebarItems = filterEmpSidebarNavigation(isManagerView).flatMap((g) => g.items);
+    const activeItem = findActiveSidebarItem(pathname || "", searchParams, sidebarItems);
+    const sectionId = activeItem ? getSidebarItemId(activeItem) : "unknown";
+    const prev = prevNavRef.current;
+    if (prev && prev.url !== url) {
+      recordPortalNavigation(prev.url, url, prev.sectionId);
+    }
+    prevNavRef.current = { url, sectionId };
+  }, [pathname, searchParams, isManagerView]);
+
+  useEffect(() => {
+    ensureFetchRefreshPatch();
+  }, []);
+
+  // Clear sidebar/module badges when the employee opens that section
+  useEffect(() => {
+    const search = typeof window !== "undefined" ? window.location.search : "";
+    void clearEmpBadgesForVisitedPath(pathname || "", search);
+  }, [pathname]);
+
+  useEffect(() => {
+    const applyStoredTheme = () => {
+      const next = readStoredEmpTheme();
+      setTheme(next);
+      applyEmpTheme(next);
+    };
+    applyStoredTheme();
+    window.addEventListener("emp-theme-change", applyStoredTheme);
+    window.addEventListener("storage", applyStoredTheme);
+    return () => {
+      window.removeEventListener("emp-theme-change", applyStoredTheme);
+      window.removeEventListener("storage", applyStoredTheme);
+    };
+  }, []);
+
+  useEffect(() => {
+    const token = localStorage.getItem("token") || localStorage.getItem("accessToken");
+    if (!token) router.replace("/login");
+  }, [router]);
+
+  useEffect(() => {
+    const syncUserFromStorage = () => {
+      try {
+        const stored = localStorage.getItem("user");
+        if (!stored) return;
+        const u = JSON.parse(stored);
+        const empId = u?.employee?.id;
+        const cached = getPageCache<any>("empProfileData");
+        const apiPhoto =
+          cached?.id === empId && cached?.employeePhotoUrl
+            ? cached.employeePhotoUrl
+            : u?.employee?.employeePhotoUrl;
+        if (apiPhoto && u.employee) {
+          u.employee.employeePhotoUrl = resolveEmpPhoto(empId, apiPhoto) ?? apiPhoto;
+        }
+        setEmpUser(u);
+
+        const ctx = getSidebarContext();
+        const userCompanyID = Number(u?.companyID || 0);
+        const sessionCompanyID = Number(sessionStorage.getItem("activeCompanyID") || 0);
+        const serviceProviderID = Number(u?.serviceProviderID || 0);
+        const shouldOverwriteStaleCtx =
+          userCompanyID > 0 &&
+          !!ctx &&
+          Number(ctx.companyID) !== userCompanyID;
+        const preferredCompanyID = shouldOverwriteStaleCtx
+          ? userCompanyID
+          : (sessionCompanyID > 0 ? sessionCompanyID : 0) ||
+            Number(ctx?.companyID || 0) ||
+            Number(u?.activeCompanyID || u?.companyID || 0);
+        if (
+          (hasCompanyAccessFlag() || u?.isCompanyOwner) &&
+          preferredCompanyID > 0 &&
+          (!ctx || shouldOverwriteStaleCtx)
+        ) {
+          const companyName =
+            (typeof u?.company === "string" ? u.company : u?.company?.companyName) ||
+            u?.employee?.company ||
+            "";
+          const serviceProviderName = u?.serviceProvider?.companyName || "";
+          setSidebarContext(
+            serviceProviderID || 0,
+            serviceProviderName,
+            preferredCompanyID,
+            companyName,
+          );
+          if (sessionCompanyID <= 0 || shouldOverwriteStaleCtx) {
+            sessionStorage.setItem("activeCompanyID", String(preferredCompanyID));
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    syncUserFromStorage();
+    window.addEventListener("emp-photo-updated", syncUserFromStorage);
+    window.addEventListener("storage", syncUserFromStorage);
+    window.addEventListener("sidebar-context-changed", syncUserFromStorage);
+    return () => {
+      window.removeEventListener("emp-photo-updated", syncUserFromStorage);
+      window.removeEventListener("storage", syncUserFromStorage);
+      window.removeEventListener("sidebar-context-changed", syncUserFromStorage);
+    };
+  }, []);
+
+  const syncPushSubscription = useCallback(async (requestPermission = false) => {
+    if (syncInFlight.current) return;
+    syncInFlight.current = true;
+    try {
+      const result = await registerPushSubscription(requestPermission);
+      if (result.ok && requestPermission) toast.success("Notifications enabled");
+    } finally {
+      syncInFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    resetPushClientStateIfNeeded();
+    if (Notification.permission === "granted") void syncPushSubscription(false);
+  }, [syncPushSubscription]);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") void refreshHomeScreenBadge();
+    };
+    void refreshHomeScreenBadge();
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, []);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (!data) return;
+      if (data.type === "NOTIFICATION_CLICK" && typeof data.url === "string") {
+        const path = data.url.startsWith("/") ? data.url : `/${data.url}`;
+        router.push(path);
+        return;
+      }
+      if (data.type !== "PUSH_NOTIFICATION") return;
+      const title = String(data.title || "EN-Time HR");
+      const body = String(data.body || "");
+      if (data.kind === "task" && data.event === "chat" && data.taskId != null) {
+        upsertInAppNotification({
+          id: `task-chat-${data.taskId}`,
+          kind: "task",
+          title,
+          body,
+          emoji: "💬",
+          at: new Date().toISOString(),
+          href: "/empMyTasks",
+          ...(data.isTeamNotification
+            ? { isTeamItem: true, subjectEmployeeId: data.subjectEmployeeId }
+            : {}),
+        });
+      } else {
+        const row = pushPayloadToInAppNotification({
+          title,
+          body,
+          url: data.url,
+          kind: data.kind,
+          memoId: data.memoId != null ? Number(data.memoId) : undefined,
+          isTeamNotification: data.isTeamNotification,
+          subjectEmployeeId: data.subjectEmployeeId,
+        });
+        if (row.kind === "payslip" && row.href === "/empPayout" && typeof body === "string") {
+          const periodMatch = body.match(/for (.+?) is ready/i);
+          if (periodMatch?.[1]) row.href = empPayoutHrefForPeriod(periodMatch[1].trim());
+        }
+        appendInAppNotification(row);
+      }
+      void refreshHomeScreenBadge();
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [router]);
+
+  const empDisplayName = empUser?.employee
+    ? `${empUser.employee.firstName || ""} ${empUser.employee.lastName || ""}`.trim() || empUser.username || "Employee"
+    : empUser?.username || "Employee";
+  const empInitials =
+    empDisplayName
+      .split(" ")
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w: string) => w[0].toUpperCase())
+      .join("") || "E";
+  const headerPhotoUrl = resolveEmpPhoto(
+    empUser?.employee?.id,
+    empUser?.employee?.employeePhotoUrl,
+  );
+
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    localStorage.setItem("_emp_appearance", next);
+    applyEmpTheme(next);
+    window.dispatchEvent(new Event("emp-theme-change"));
+  };
+
+  const mustSetFirstPassword = employeeMustChangePassword(empUser);
+  const handleChangePassword = async () => {
+    const currentPassword = mustSetFirstPassword
+      ? readTemporaryLoginPassword()
+      : pwdForm.oldPassword;
+    if (mustSetFirstPassword && !currentPassword) {
+      toast.error("Sign in again to change your temporary password.");
+      return;
+    }
+    if ((!mustSetFirstPassword && !pwdForm.oldPassword) || !pwdForm.newPassword) {
+      toast.error("All fields are required");
+      return;
+    }
+    if (!isPasswordValid(pwdForm.newPassword)) {
+      toast.error(PASSWORD_POLICY_MESSAGE);
+      return;
+    }
+    if (pwdForm.newPassword !== pwdForm.confirmPassword) {
+      toast.error("Passwords do not match");
+      return;
+    }
+    try {
+      setPwdLoading(true);
+      const empId = empUser?.employee?.id;
+      if (!empId) {
+        toast.error("Employee not found");
+        return;
+      }
+      const token = localStorage.getItem("token") || localStorage.getItem("accessToken");
+      const res = await fetch(`/backend/manage-emp/${empId}/change-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ oldPassword: currentPassword, newPassword: pwdForm.newPassword }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.message || "Failed to change password");
+      }
+      setShowChangePassword(false);
+      setPwdForm({ oldPassword: "", newPassword: "", confirmPassword: "" });
+      if (mustSetFirstPassword) {
+        clearTemporaryLoginPassword();
+        toast.success("Password changed successfully. Please login again.");
+        clearClientSession();
+        window.location.href = "/login";
+        return;
+      }
+      toast.success("Password changed successfully");
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Failed to change password");
+    } finally {
+      setPwdLoading(false);
+    }
+  };
+
+  const handleSidebarRefresh = useCallback(() => {
+    router.refresh();
+    void refreshHomeScreenBadge();
+  }, [router]);
+
+  return (
+    <EmpPortalPageProvider>
+    <ListToolbarActionsProvider>
+    <div className="emp-pwa-shell emp-portal-desktop flex h-dvh max-h-dvh overflow-hidden bg-background" data-theme={theme}>
+
+      <EmpSidebar
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed((v) => !v)}
+        onRefresh={handleSidebarRefresh}
+      />
+
+      {/* Main column */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+        <div className="relative z-50 shrink-0">
+        {/* Top navbar */}
+        <EmpPortalTopbar
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          empDisplayName={empDisplayName}
+          empInitials={empInitials}
+          headerPhotoUrl={headerPhotoUrl}
+          onChangePassword={() => setShowChangePassword(true)}
+          onLogout={() => {
+            clearTemporaryLoginPassword();
+            clearClientSession();
+            window.location.href = "/login";
+          }}
+        />
+
+        {/* More module categories — directly under top navbar */}
+        <Suspense fallback={null}>
+          <EmpMoreCategoryTabNav />
+        </Suspense>
+
+        {/* Administration setup categories — directly under top navbar */}
+        <Suspense fallback={null}>
+          <EmpSetupCategoryTabNav />
+        </Suspense>
+
+        {/* Module workspace tabs — hide on leave/reimb detail & apply routes (no duplicate bars) */}
+        {activeModule &&
+          activeModule.id !== "home" &&
+          activeModule.id !== "profile" &&
+          moduleTabs.length > 1 &&
+          !isLeaveReimbSubRoute(pathname) && (
+          <EmpWorkspaceTabNav workspace={activeModule} tabs={moduleTabs} />
+        )}
+        </div>
+
+        {!hideBottomNav && <EmpMarkoutReminderBanner />}
+
+        <main className="emp-portal-main relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-contain bg-background">
+          <div className="hrms-admin-content emp-workspace-shell mx-auto box-border flex min-h-0 w-full min-w-0 max-w-[1400px] flex-1 flex-col px-8 py-5">
+            {children}
+          </div>
+        </main>
+      </div>
+
+      <Dialog open={showChangePassword} onOpenChange={setShowChangePassword}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Change Password</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            {mustSetFirstPassword ? (
+              <p className="text-sm text-gray-600">
+                Choose a new password. You will sign in again after it is saved.
+              </p>
+            ) : (
+            <div>
+              <Label>Current Password</Label>
+              <div className="relative">
+                <Input
+                  type={showOldPwd ? "text" : "password"}
+                  value={pwdForm.oldPassword}
+                  onChange={(e) => setPwdForm({ ...pwdForm, oldPassword: e.target.value })}
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowOldPwd((v) => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  tabIndex={-1}
+                >
+                  {showOldPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+            )}
+            <div>
+              <Label>New Password</Label>
+              <div className="relative">
+                <Input
+                  type={showNewPwd ? "text" : "password"}
+                  value={pwdForm.newPassword}
+                  onChange={(e) => setPwdForm({ ...pwdForm, newPassword: e.target.value })}
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPwd((v) => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  tabIndex={-1}
+                >
+                  {showNewPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <PasswordRuleHints password={pwdForm.newPassword} />
+            </div>
+            <div>
+              <Label>Confirm New Password</Label>
+              <div className="relative">
+                <Input
+                  type={showConfirmPwd ? "text" : "password"}
+                  value={pwdForm.confirmPassword}
+                  onChange={(e) => setPwdForm({ ...pwdForm, confirmPassword: e.target.value })}
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPwd((v) => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  tabIndex={-1}
+                >
+                  {showConfirmPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+            <Button onClick={handleChangePassword} disabled={pwdLoading} className="w-full">
+              {pwdLoading ? "Changing..." : "Change Password"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+    </ListToolbarActionsProvider>
+    </EmpPortalPageProvider>
+  );
+}

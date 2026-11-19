@@ -1,0 +1,186 @@
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+
+/** Employees who report to `managerEmployeeId` via Manage Employee → Manager links. */
+@Injectable()
+export class EmpManagerScopeService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /** Direct reportees only (one management level — not transitive). */
+  async getDirectReporteeIds(managerEmployeeId: number): Promise<number[]> {
+    const links = await this.prisma.employeeLink.findMany({
+      where: { linkedEmployeeId: managerEmployeeId },
+      select: { employeeId: true },
+    });
+    return [...new Set(links.map((l) => l.employeeId))];
+  }
+
+  /**
+   * All reportees under this manager, including skip-level (reportees of reportees).
+   * Cycle-safe: never revisits an id and never includes the manager themselves.
+   */
+  async getDescendantReporteeIds(managerEmployeeId: number): Promise<number[]> {
+    const descendants: number[] = [];
+    const visited = new Set<number>([managerEmployeeId]);
+    let frontier = [managerEmployeeId];
+
+    while (frontier.length > 0) {
+      const links = await this.prisma.employeeLink.findMany({
+        where: { linkedEmployeeId: { in: frontier } },
+        select: { employeeId: true },
+      });
+      frontier = [];
+      for (const link of links) {
+        const id = Number(link.employeeId);
+        if (!Number.isFinite(id) || visited.has(id)) continue;
+        visited.add(id);
+        descendants.push(id);
+        frontier.push(id);
+      }
+    }
+
+    return descendants;
+  }
+
+  /** Self plus the full reporting tree (direct and skip-level). */
+  async getReporteeIds(managerEmployeeId: number): Promise<number[]> {
+    const descendants = await this.getDescendantReporteeIds(managerEmployeeId);
+    return [managerEmployeeId, ...descendants];
+  }
+
+  /** Skip-level only: reportees of reportees, excluding people linked directly to this manager. */
+  async getNestedReporteeIds(managerEmployeeId: number): Promise<number[]> {
+    const [direct, descendants] = await Promise.all([
+      this.getDirectReporteeIds(managerEmployeeId),
+      this.getDescendantReporteeIds(managerEmployeeId),
+    ]);
+    const directSet = new Set(direct);
+    return descendants.filter((id) => !directSet.has(id));
+  }
+
+  async hasReportees(managerEmployeeId: number): Promise<boolean> {
+    const count = await this.prisma.employeeLink.count({
+      where: { linkedEmployeeId: managerEmployeeId },
+    });
+    return count > 0;
+  }
+
+  /**
+   * Team Attendance is for company owners, directors, and anyone with at least
+   * one employee assigned to them as manager.
+   */
+  async canUseTeamAttendance(employeeId: number, companyId?: number | null): Promise<boolean> {
+    const profile = await this.dashboardProfile(employeeId, companyId);
+    return profile.leadership || profile.hasReportees;
+  }
+
+  /** Owner/director flag and whether anyone reports to this employee. */
+  async dashboardProfile(
+    employeeId: number,
+    companyId?: number | null,
+  ): Promise<{ leadership: boolean; hasReportees: boolean }> {
+    if (!Number.isFinite(employeeId) || employeeId <= 0) {
+      return { leadership: false, hasReportees: false };
+    }
+    const emp = await this.prisma.manageEmployee.findFirst({
+      where: {
+        id: employeeId,
+        isDeleted: false,
+        ...(companyId ? { companyID: companyId } : {}),
+      },
+      select: {
+        isCompanyOwner: true,
+        ownerTitle: true,
+        empType: true,
+        designations: { select: { designation: true } },
+      },
+    });
+    if (!emp) return { leadership: false, hasReportees: false };
+    const label = [emp.ownerTitle, emp.empType, emp.designations?.designation]
+      .filter(Boolean)
+      .join(' ');
+    const leadership = emp.isCompanyOwner || /\b(owner|directors?)\b/i.test(label);
+    return { leadership, hasReportees: await this.hasReportees(employeeId) };
+  }
+
+  /** Managers linked to this employee in Manage Employee → Manager. */
+  async getManagerIdsForEmployee(employeeId: number): Promise<number[]> {
+    const links = await this.prisma.employeeLink.findMany({
+      where: { employeeId },
+      select: { linkedEmployeeId: true },
+    });
+    return links.map((l) => l.linkedEmployeeId);
+  }
+
+  /**
+   * Every manager above this employee, including skip-level and the top owner
+   * in the same chain. Cycle-safe and does not include the employee.
+   */
+  async getAncestorManagerIds(employeeId: number): Promise<number[]> {
+    const ancestors: number[] = [];
+    const visited = new Set<number>([employeeId]);
+    let frontier = [employeeId];
+
+    while (frontier.length > 0) {
+      const links = await this.prisma.employeeLink.findMany({
+        where: { employeeId: { in: frontier } },
+        select: { linkedEmployeeId: true },
+      });
+      frontier = [];
+      for (const link of links) {
+        const id = Number(link.linkedEmployeeId);
+        if (!Number.isFinite(id) || visited.has(id)) continue;
+        visited.add(id);
+        ancestors.push(id);
+        frontier.push(id);
+      }
+    }
+
+    return ancestors;
+  }
+
+  async getEmployeeDisplayName(employeeId: number): Promise<string> {
+    const e = await this.prisma.manageEmployee.findUnique({
+      where: { id: employeeId },
+      select: { employeeFirstName: true, employeeLastName: true, employeeID: true },
+    });
+    const name = [e?.employeeFirstName, e?.employeeLastName].filter(Boolean).join(' ').trim();
+    return name || e?.employeeID || `Employee #${employeeId}`;
+  }
+
+  /** Manager may view the reporting tree, colleagues in the same department, or same-company directory peers. */
+  async canViewEmployee(managerEmployeeId: number, targetEmployeeId: number): Promise<boolean> {
+    if (managerEmployeeId === targetEmployeeId) return true;
+    const descendants = await this.getDescendantReporteeIds(managerEmployeeId);
+    if (descendants.includes(targetEmployeeId)) return true;
+
+    const [manager, target] = await Promise.all([
+      this.prisma.manageEmployee.findUnique({
+        where: { id: managerEmployeeId },
+        select: { departmentNameID: true, companyID: true },
+      }),
+      this.prisma.manageEmployee.findUnique({
+        where: { id: targetEmployeeId },
+        select: { departmentNameID: true, companyID: true, isDeleted: true },
+      }),
+    ]);
+    if (!manager || !target || target.isDeleted) return false;
+    if (manager.companyID != null && manager.companyID === target.companyID) return true;
+    if (
+      manager.departmentNameID != null &&
+      manager.departmentNameID === target.departmentNameID
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /** First-person employee notification → manager-facing copy. */
+  managerNotificationBody(body: string, employeeName: string): string {
+    return body
+      .replace(/^Your /i, `${employeeName}'s `)
+      .replace(/^You have been /i, `${employeeName} has been `)
+      .replace(/^You have /i, `${employeeName} has `)
+      .replace(/^You were /i, `${employeeName} was `);
+  }
+}

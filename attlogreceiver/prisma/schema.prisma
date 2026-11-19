@@ -1,0 +1,109 @@
+// ATTLOG Receiver contract.
+// process_attlog.punch_time is TIMESTAMP WITHOUT TIME ZONE and stores Asia/Kolkata wall-clock digits.
+// created_at / updated_at / processed_at / exported_at are timestamptz instants.
+// Do not rename att_devices, raw_attlog, or process_attlog.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model AttDevice {
+  id              BigInt   @id @default(autoincrement())
+  vendor          String   @db.VarChar(30)
+  deviceSn        String   @unique(map: "att_devices_device_sn_key") @map("device_sn") @db.VarChar(150)
+  deviceName      String   @map("device_name") @db.VarChar(150)
+  deviceModel     String?  @map("device_model") @db.VarChar(100)
+  firmwareVersion String?  @map("firmware_version") @db.VarChar(100)
+  sourceDeviceId  String?  @unique(map: "att_devices_source_device_id_key") @map("source_device_id") @db.VarChar(100)
+  status          Int      @db.SmallInt
+  metadata        Json?
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([vendor], map: "att_devices_vendor_idx")
+  @@index([status], map: "att_devices_status_idx")
+  @@map("att_devices")
+}
+
+model RawAttlog {
+  id                 BigInt    @id @default(autoincrement())
+  vendor             String    @db.VarChar(30)
+  deviceSn           String    @map("device_sn") @db.VarChar(150)
+  requestPath        String?   @map("request_path") @db.Text
+  queryParams        Json?     @map("query_params")
+  rawBody            String?   @map("raw_body") @db.Text
+  ipAddress          String?   @map("ip_address") @db.VarChar(50)
+  isValid            Boolean   @map("is_valid")
+  logType            String    @map("log_type") @db.VarChar(30)
+  processingStatus   String    @map("processing_status") @db.VarChar(30)
+  verificationReason String?   @map("verification_reason") @db.Text
+  userId             String?   @map("user_id") @db.VarChar(100)
+  sourcePunchTime    String?   @map("source_punch_time") @db.Text
+  punchTime          String?   @map("punch_time") @db.Text
+  status             String?   @db.VarChar(30)
+  workCode           String?   @map("work_code") @db.VarChar(50)
+  authType           String?   @map("auth_type") @db.VarChar(30)
+  dedupeHash         String    @unique @map("dedupe_hash") @db.VarChar(64)
+  duplicateCount     Int       @default(0) @map("duplicate_count")
+  retryCount         Int       @default(0) @map("retry_count")
+  lastError          String?   @map("last_error") @db.Text
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  processedAt        DateTime? @map("processed_at") @db.Timestamptz(6)
+
+  processAttlog ProcessAttlog?
+
+  @@index([vendor], map: "raw_attlog_vendor_idx")
+  @@index([deviceSn], map: "raw_attlog_device_sn_idx")
+  @@index([userId], map: "raw_attlog_user_id_idx")
+  @@index([logType], map: "raw_attlog_log_type_idx")
+  @@index([processingStatus], map: "raw_attlog_processing_status_idx")
+  @@index([isValid], map: "raw_attlog_is_valid_idx")
+  @@index([createdAt], map: "raw_attlog_created_at_idx")
+  @@index([processingStatus, logType, isValid, id], map: "raw_attlog_worker_idx")
+  @@map("raw_attlog")
+}
+
+model ProcessAttlog {
+  id              BigInt    @id @default(autoincrement())
+  rawAttlogId     BigInt    @unique @map("raw_attlog_id")
+  vendor          String    @db.VarChar(30)
+  deviceSn        String    @map("device_sn") @db.VarChar(150)
+  userId          String    @map("user_id") @db.VarChar(100)
+  punchTime       DateTime  @map("punch_time") @db.Timestamp(0)
+  sourcePunchTime String?   @map("source_punch_time") @db.Text
+  status          String?   @db.VarChar(30)
+  workCode        String?   @map("work_code") @db.VarChar(50)
+  authType        String?   @map("auth_type") @db.VarChar(30)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  export          Int       @default(0) @db.SmallInt
+  exportedAt      DateTime? @map("exported_at") @db.Timestamptz(6)
+
+  rawAttlog RawAttlog @relation(fields: [rawAttlogId], references: [id], onDelete: Restrict)
+
+  @@index([rawAttlogId], map: "process_attlog_raw_attlog_id_idx")
+  @@index([deviceSn], map: "process_attlog_device_sn_idx")
+  @@index([userId], map: "process_attlog_user_id_idx")
+  @@index([punchTime], map: "process_attlog_punch_time_idx")
+  @@index([export], map: "process_attlog_export_idx")
+  @@index([export, id], map: "process_attlog_export_id_idx")
+  @@map("process_attlog")
+}
+
+model AdminAuditLog {
+  id         BigInt   @id @default(autoincrement())
+  action     String   @db.VarChar(50)
+  actor      String   @db.VarChar(100)
+  targetType String   @map("target_type") @db.VarChar(50)
+  targetId   String?  @map("target_id") @db.VarChar(100)
+  details    Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([createdAt], map: "admin_audit_log_created_at_idx")
+  @@index([action], map: "admin_audit_log_action_idx")
+  @@map("admin_audit_log")
+}

@@ -1,0 +1,178 @@
+import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { PrismaModule } from './prisma/prisma.module';
+import { ServeStaticModule } from '@nestjs/serve-static';
+import { join } from 'path';
+import { CompanyModule } from './company/company.module';
+import { BranchesModule } from './branches/branches.module';
+import { DepartmentsModule } from './departments/departments.module';
+import { CompanyHierarchyModule } from './company-hierarchy/company-hierarchy.module';
+import { DesignationsModule } from './designations/designations.module';
+import { BankDetailsModule } from './bank-details/bank-details.module';
+import { ContractorsModule } from './contractors/contractors.module';
+import { AttendancePolicyModule } from './attendance-policy/attendance-policy.module';
+import { LeavePolicyModule } from './leave-policy/leave-policy.module';
+import { ManageHolidayModule } from './manage-holiday/manage-holiday.module';
+import { PublicHolidayModule } from './public-holiday/public-holiday.module';
+import { LeaveApplicationRequestModule } from './leave-application-request/leave-application-request.module';
+import { LeaveApplicationModule } from './leave-application/leave-application.module';
+import { FilesModule } from './files/files.module';
+import { DevicesModule } from './devices/devices.module';
+import { ReceiverClientModule } from './receiver-client/receiver-client.module';
+import { ManageEmployeeModule } from './manage-employee/manage-employee.module';
+import { EmpCurrentPositionModule } from './emp-current-position/emp-current-position.module';
+import { PromotionRequestModule } from './promotion-request/promotion-request.module';
+import { EmpPromotionModule } from './emp-promotion/emp-promotion.module';
+import { EmpFieldSiteAttendanceModule } from './emp-field-site-attendance/emp-field-site-attendance.module';
+import { EmpAttendanceRegulariseModule } from './emp-attendance-regularise/emp-attendance-regularise.module';
+import { SalaryCycleModule } from './salary-cycle/salary-cycle.module';
+import { SalaryAllowanceModule } from './salary-allowance/salary-allowance.module';
+import { SalaryDeductionModule } from './salary-deduction/salary-deduction.module';
+import { MonthlyPayGradeModule } from './monthly-pay-grade/monthly-pay-grade.module';
+import { HourlyGradeModule } from './hourly-grade/hourly-grade.module';
+import { BonusSetupModule } from './bonus-setup/bonus-setup.module';
+import { BonousAllocationModule } from './bonous-allocation/bonous-allocation.module';
+import { WorkShiftModule } from './work-shift/work-shift.module';
+import { AttlogListenerModule } from './attlog-listener/attlog-listener.module';
+import { EmpAttendanceSyncModule } from './emp-attendance-sync/emp-attendance-sync.module';
+import { EsslRawProcessorModule } from './essl-raw-processor/essl-raw-processor.module';
+import { CalenderModule } from './calender/calender.module';
+import { GenerateSalaryModule } from './generate-salary/generate-salary.module';
+import { EmpAttendanceLogsModule } from './emp-attendance-logs/emp-attendance-logs.module';
+import { SalaryAdvanceModule } from './salary-advance/salary-advance.module';
+import { SalaryAdvanceRepaymentModule } from './salary-advance-repayment/salary-advance-repayment.module';
+import { ReimbursementModule } from './reimbursement/reimbursement.module';
+import { UsersModule } from './users/users.module';
+import { AuthModule } from './auth/auth.module';
+import { OvertimeModule } from './overtime/overtime.module';
+import { RosterModule } from './roster/roster.module';
+import { PfcomplianceModule } from './pfcompliance/pfcompliance.module';
+import { ESICComplianceModule } from './esiccompliance/esiccompliance.module';
+import { PTComplianceModule } from './ptcompliance/ptcompliance.module';
+import { TerminationModule } from './termination/termination.module';
+import { EmployeeMemoModule } from './employee-memo/employee-memo.module';
+import { ProcessAttLogsModule } from './process_att_logs/process_att_logs.module';
+import { PrivilegedLeaveModule } from './privileged-leave/privileged-leave.module';
+import { EmployeeHolidayOverrideModule } from './employee-holiday-override/employee-holiday-override.module';
+import { EmployeeWeeklyOffModule } from './employee-weekly-off/employee-weekly-off.module';
+import { ImportAttendanceModule } from './import-attendance/import-attendance.module';
+import { ContractorPayoutModule } from './contractor-payout/contractor-payout.module';
+import { ComplianceRulesModule } from './compliance-rules/compliance-rules.module';
+import { EmpLocationAttendanceModule } from './emp-location-attendance/emp-location-attendance.module';
+import { PushNotificationsModule } from './push-notifications/push-notifications.module';
+import { EmpLeaveBalanceModule } from './emp-leave-balance/emp-leave-balance.module';
+import { GeoModule } from './geo/geo.module';
+import { TaskManagementModule } from './task-management/task-management.module';
+import { EnplSyncModule } from './enpl-sync/enpl-sync.module';
+import { EmpNotificationsModule } from './emp-notifications/emp-notifications.module';
+import { DashboardOverviewModule } from './dashboard-overview/dashboard-overview.module';
+import { DashboardLayoutModule } from './dashboard-layout/dashboard-layout.module';
+import { MailModule } from './mail/mail.module';
+import { EmailTemplateModule } from './email-template/email-template.module';
+import { EmpManagerScopeModule } from './common/emp-manager-scope.module';
+import { BackupModule } from './backup/backup.module';
+import { GoogleMapsModule } from './google-maps/google-maps.module';
+import { ExternalApisModule } from './external-apis/external-apis.module';
+import { AuditLogModule } from './audit-log/audit-log.module';
+import { SubscriptionModule } from './subscription/subscription.module';
+import { SystemDashboardModule } from './system-dashboard/system-dashboard.module';
+import { CompanyModulesModule } from './company-modules/company-modules.module';
+import { ApprovalWorkflowModule } from './approval-workflow/approval-workflow.module';
+import { ApprovalRequestModule } from './approval-request/approval-request.module';
+import { EmployeePermissionsModule } from './employee-permissions/employee-permissions.module';
+import { CompanyPolicyModule } from './company-policy/company-policy.module';
+import { SystemSettingsModule } from './system-settings/system-settings.module';
+import { CompanyModuleAccessModule } from './common/company-module-access.module';
+
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env'] }),
+    EmpManagerScopeModule,
+    CompanyModuleAccessModule,
+    SystemSettingsModule,
+    MailModule,
+    PrismaModule,
+    ServeStaticModule.forRoot({
+      rootPath: join(__dirname, '..', '..', 'uploads'),
+      serveRoot: '/uploads', // files accessible via /uploads/*
+    }),
+    CompanyModule,
+    BranchesModule,
+    DepartmentsModule,
+    CompanyHierarchyModule,
+    DesignationsModule,
+    BankDetailsModule,
+    ContractorsModule,
+    AttendancePolicyModule,
+    LeavePolicyModule,
+    ManageHolidayModule,
+    PublicHolidayModule,
+    LeaveApplicationRequestModule,
+    LeaveApplicationModule,
+    FilesModule,
+    DevicesModule,
+    ReceiverClientModule,
+    ManageEmployeeModule,
+    EmpCurrentPositionModule,
+    PromotionRequestModule,
+    EmpPromotionModule,
+    EmpFieldSiteAttendanceModule,
+    EmpAttendanceRegulariseModule,
+    SalaryCycleModule,
+    SalaryAllowanceModule,
+    SalaryDeductionModule,
+    MonthlyPayGradeModule,
+    HourlyGradeModule,
+    BonusSetupModule,
+    BonousAllocationModule,
+    WorkShiftModule,
+    AttlogListenerModule,
+    EmpAttendanceSyncModule,
+    EsslRawProcessorModule,
+    CalenderModule,
+    GenerateSalaryModule,
+    EmpAttendanceLogsModule,
+    SalaryAdvanceModule,
+    SalaryAdvanceRepaymentModule,
+    ReimbursementModule,
+    UsersModule,
+    AuthModule,
+    OvertimeModule,
+    RosterModule,
+    PfcomplianceModule,
+    ESICComplianceModule,
+    PTComplianceModule,
+    TerminationModule,
+    EmployeeMemoModule,
+    ProcessAttLogsModule,
+    PrivilegedLeaveModule,
+    EmployeeHolidayOverrideModule,
+    EmployeeWeeklyOffModule,
+    ImportAttendanceModule,
+    ContractorPayoutModule,
+    ComplianceRulesModule,
+    EmpLocationAttendanceModule,
+    PushNotificationsModule,
+    EmpLeaveBalanceModule,
+    GeoModule,
+    EnplSyncModule,
+    TaskManagementModule,
+    EmpNotificationsModule,
+    DashboardOverviewModule,
+    DashboardLayoutModule,
+    EmailTemplateModule,
+    BackupModule,
+    GoogleMapsModule,
+    ExternalApisModule,
+    AuditLogModule,
+    SubscriptionModule,
+    SystemDashboardModule,
+    CompanyModulesModule,
+    ApprovalWorkflowModule,
+    ApprovalRequestModule,
+    EmployeePermissionsModule,
+    CompanyPolicyModule,
+  ],
+})
+export class AppModule {}

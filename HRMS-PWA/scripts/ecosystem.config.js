@@ -1,0 +1,27 @@
+// OpenHRM production — APPSERVER002 (ports 3000 / 8001)
+// Start: pm2 start /var/www/openhrm/scripts/ecosystem.config.js
+module.exports = {
+  apps: [
+    {
+      name: "entimehr-backend",
+      cwd: "/var/www/openhrm/backend",
+      script: "dist/src/main.js",
+      instances: 1,
+      exec_mode: "fork",
+      env: { NODE_ENV: "production", PORT: "8001" },
+      max_memory_restart: "512M",
+      autorestart: true,
+    },
+    {
+      name: "entimehr-frontend",
+      cwd: "/var/www/openhrm/frontend",
+      script: "npm",
+      args: "run start:prod",
+      env: { NODE_ENV: "production", PORT: "3000" },
+      instances: 1,
+      exec_mode: "fork",
+      max_memory_restart: "512M",
+      autorestart: true,
+    },
+  ],
+};

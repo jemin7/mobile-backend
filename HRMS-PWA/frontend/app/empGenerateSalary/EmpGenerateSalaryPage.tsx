@@ -1,0 +1,2063 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { toast } from "sonner";
+import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import { Label } from "../components/ui/label";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
+import { Badge } from "../components/ui/badge";
+import { Icon } from "@iconify/react";
+import { Plus, Search, Edit, Trash2, Download } from "lucide-react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { useCurrentUser } from "../hooks/useCurrentUser"
+import { getActiveCompanyId, getSidebarContext } from "../utils/sidebarContext";
+import { resolveScopedCompanyId } from "../utils/scopeContext";
+import { getPageCache, setPageCache } from "../utils/pageCache";
+import { formatPayslipPeriodLabel } from "../utils/payslipPeriodLabel";
+import { isCompanyAdminLikeRole } from "@/lib/companyAccess";
+import {
+  calendarDateKey,
+  leaveDayPay,
+  regularisationPay,
+  shiftNetMinutes,
+  percentageDeductionAmount,
+} from "../utils/payrollDayStatus";
+
+
+/* =======================
+   Types (aligned to API)
+   ======================= */
+
+interface SP { id: number; companyName?: string }
+interface CO { id: number; companyName?: string; financialYearStart?: string }
+interface BR { id: number; branchName?: string; companyID?: number }
+interface Emp {
+  id: number
+  employeeID?: string
+  employeeFirstName?: string
+  employeeLastName?: string
+  attendancePolicyID?: number
+  workShiftID?: number
+  monthlyPayGradeID?: number
+  // salary fields (various names supported)
+  monthlyGrossSalary?: number
+  grossSalary?: number
+  monthlySalary?: number
+  ctcMonthly?: number
+  ctc?: number
+  salary?: number
+  totalSalary?: number
+  payrollSalary?: number
+  departments?: {
+    id: number
+    serviceProviderID?: number
+    companyID?: number
+    branchesID?: number
+    departmentName?: string
+  }
+  designations?: {
+    id: number
+    serviceProviderID?: number
+    companyID?: number
+    branchesID?: number
+    designation?: string  // Note: typo in API field name
+  }
+}
+
+interface SalaryAdvanceRepayment {
+  id: number;
+  salaryAdvanceID: number;
+  approvedAmount: string;
+  startMonth: string;
+  amount: string;
+  periodLabel?: string | null;
+  status?: string | null;
+  generateSalaryID?: number | null;
+  createdAt: string;
+  updatedAt: string;
+  salaryAdvance: {
+    id: number;
+    serviceProviderID: number;
+    companyID: number;
+    branchesID: number;
+    manageEmployeeID: number;
+    previousAdvancesDue: string;
+    advanceAmount: string;
+    reason: string;
+    requestType?: string | null;
+    repaymentTanure: string | null;
+    status: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+}
+
+interface GenerateSalaryDTO {
+  serviceProviderID?: number | null
+  companyID?: number | null
+  branchesID?: number | null
+  employeeID: number
+  monthPeriod: string
+}
+
+interface GenerateSalaryRow {
+  id: number
+  serviceProviderID?: number | null
+  companyID?: number | null
+  branchesID?: number | null
+  employeeID: number
+  monthPeriod: string
+  status?: string
+  serviceProvider?: { companyName?: string }
+  company?: { companyName?: string }
+  branches?: { branchName?: string }
+  manageEmployee?: Emp
+  createdAt?: string
+}
+
+/* =======================
+   Constants / helpers
+   ======================= */
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "/backend";
+
+const API = {
+  sp: "/backend/service-provider",
+  co: "/backend/company",
+  br: "/backend/branches",
+  emp: "/backend/manage-emp",
+  generateSalary: "/backend/generate-salary",
+  salaryAdvanceRepayment: "/backend/salary-advance-repayment", // Add this
+  reimbursement: "/backend/reimbursement", // Add this
+};
+
+const MIN_CHARS = 0;
+
+
+
+function empName(e?: Emp | null) {
+  const f = (e?.employeeFirstName ?? "").trim();
+  const l = (e?.employeeLastName ?? "").trim();
+  return [f, l].filter(Boolean).join(" ");
+}
+/* =======================
+   Utility functions
+   ======================= */
+
+function roundToNearestRupee(amount: number): number {
+  return Math.round(amount);
+}
+
+
+
+const ymd2 = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/** Parse "DD Month YYYY to DD Month YYYY" → start/end Date */
+/**
+ * parseCycle() — safely handles both "Month YYYY" and "DD Month YYYY to DD Month YYYY"
+ */
+function parseCycle(label?: string) {
+  if (!label || typeof label !== "string") {
+    throw new Error(`Invalid month label: ${label}`);
+  }
+
+  // Helper: month name → number
+  const monthNum = (name: string) => {
+    const months = [
+      "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December"
+    ];
+    const idx = months.findIndex(
+      (m) => m.toLowerCase() === name.toLowerCase()
+    );
+    if (idx === -1) throw new Error(`Unknown month name: ${name}`);
+    return String(idx + 1).padStart(2, "0");
+  };
+
+  // ✅ Case 1: Label like "October 2025"
+  if (!label.includes(" to ")) {
+    const [monthName, yearStr] = label.trim().split(" ");
+    const year = Number(yearStr);
+    if (!monthName || !year) {
+      throw new Error(`Invalid month label format: ${label}`);
+    }
+
+    // start: first day of month, end: last day of same month
+    const start = new Date(`${year}-${monthNum(monthName)}-01T00:00:00`);
+    const end = new Date(year, start.getMonth() + 1, 0, 23, 59, 59);
+    return { start, end };
+  }
+
+  // ✅ Case 2: Label like "01 October 2025 to 31 October 2025"
+  const [left, right] = label.split(" to ").map((s) => s.trim());
+  const [sDay, sMonth, sYear] = left.split(" ");
+  const [eDay, eMonth, eYear] = right.split(" ");
+  const start = new Date(`${sYear}-${monthNum(sMonth)}-${sDay}T00:00:00`);
+  const end = new Date(`${eYear}-${monthNum(eMonth)}-${eDay}T23:59:59`);
+  return { start, end };
+}
+
+
+
+/** SAFE inclusive date iterator returning array (avoids generator/downlevel issues) */
+function daysIterArray(start: Date, end: Date): Date[] {
+  const arr: Date[] = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    arr.push(new Date(d));
+  }
+  return arr;
+}
+
+/* =======================
+   Data helpers (HTTP)
+   ======================= */
+
+async function robustGet(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+/* =======================
+   Salary calculation helpers
+   ======================= */
+
+
+function recoveryLineName(requestType?: string | null) {
+  return requestType === "EMPLOYEE_LOAN" ? "Employee Loan EMI" : "Salary Advance Recovery";
+}
+
+async function getSalaryAdvanceRepayments(
+  employeeId: number,
+  selectedMonthLabel: string,
+  salaryId?: number,
+): Promise<{ name: string; amount: number }[]> {
+  try {
+    const repayments: SalaryAdvanceRepayment[] = await robustGet(API.salaryAdvanceRepayment);
+    const totals = new Map<string, number>();
+    repayments
+      .filter((repayment) => Number(repayment.salaryAdvance?.manageEmployeeID) === Number(employeeId))
+      .filter((repayment) => {
+        const linked = repayment.generateSalaryID != null ? Number(repayment.generateSalaryID) : null;
+        if (salaryId && linked === Number(salaryId)) return true;
+        if (linked || repayment.status === "Recovered") return false;
+        const advance = repayment.salaryAdvance;
+        const legacy = !repayment.periodLabel;
+        const eligible =
+          advance?.status === "Disbursed" ||
+          advance?.status === "Partially Recovered" ||
+          (advance?.status === "Approved" && legacy);
+        if (!eligible) return false;
+        if (repayment.periodLabel) return repayment.periodLabel === selectedMonthLabel;
+        if (!repayment.startMonth) return false;
+        const { start } = parseCycle(selectedMonthLabel);
+        const selectedMonthStart = new Date(start.getFullYear(), start.getMonth(), 1);
+        const repaymentDate = new Date(repayment.startMonth);
+        const repaymentMonthStart = new Date(repaymentDate.getUTCFullYear(), repaymentDate.getUTCMonth(), 1);
+        return repaymentMonthStart.getTime() === selectedMonthStart.getTime();
+      })
+      .forEach((repayment) => {
+        const name = recoveryLineName(repayment.salaryAdvance?.requestType);
+        totals.set(name, (totals.get(name) || 0) + (Number(repayment.amount) || 0));
+      });
+    return [...totals.entries()]
+      .filter(([, amount]) => amount > 0)
+      .map(([name, amount]) => ({ name, amount: Math.round(amount) }));
+  } catch (error) {
+    console.error("Error fetching salary advance repayments:", error);
+    return [];
+  }
+}
+
+/** Find a monthly pay grade for company + branch (or by emp.monthlyPayGradeID if present) */
+async function getMonthlyPayGrade(companyId: number, branchId: number, emp?: any) {
+  const grades: any[] = await robustGet("/backend/monthly-pay-grade");
+  if (emp?.monthlyPayGradeID) {
+    const g = grades.find(x => x.id === emp.monthlyPayGradeID);
+    if (g) return g;
+  }
+  const g2 = grades.find(x => x.companyID === companyId && x.branchesID === branchId);
+  if (!g2) throw new Error("Monthly Pay Grade not found for this company/branch.");
+  return g2;
+}
+
+/** Get company + branch names */
+async function getCompanyAndBranch(companyId: number, branchId: number) {
+  const companies: any[] = await robustGet("/backend/company");
+  const branches: any[] = await robustGet("/backend/branches");
+  const company = companies.find((c: any) => c.id === companyId) || {};
+  const branch = branches.find((b: any) => b.id === branchId) || {};
+  return {
+    companyName: company.companyName || company.name || `Company #${companyId}`,
+    branchName: branch.branchName || branch.name || `Branch #${branchId}`
+  };
+}
+
+/** Get shift-days for an employee (to count weekly-off occurrences) */
+async function getShiftDays(emp: any) {
+  const workShifts: any[] = await robustGet("/backend/work-shift");
+  const empShift = workShifts.find(ws => ws.id === emp.workShiftID);
+  return empShift?.workShiftDay || [];
+}
+
+/** Count weekly-off occurrences in the cycle (these are paid) */
+function countWeeklyOffOccurrences(shiftDays: any[], start: Date, end: Date) {
+  const offNames = new Set(shiftDays.filter((d: any) => d.weeklyOff).map((d: any) => d.weekDay));
+  let count = 0;
+  for (const d of daysIterArray(start, end)) {
+    const wd = d.toLocaleString("en-US", { weekday: "long" });
+    if (offNames.has(wd)) count++;
+  }
+  return count;
+}
+
+/** Public holiday days for branch within cycle */
+async function getHolidayCount(branchId: number, start: Date, end: Date) {
+  const holidays: any[] = await robustGet("/backend/public-holiday");
+  const branchHolidays = holidays.filter((h: any) => h.branchesID === branchId);
+  let set = new Set<string>();
+  branchHolidays.forEach((h: any) => {
+    const hs = new Date(h.startDate), he = new Date(h.endDate);
+    for (let d = new Date(hs); d <= he; d.setDate(d.getDate() + 1)) {
+      if (d >= start && d <= end) set.add(ymd2(d));
+    }
+  });
+  return set.size;
+}
+
+/** Split approved leaves to Non-LoP vs LoP (in days) within cycle */
+async function getLeaveBreakdown(employeeId: number, start: Date, end: Date) {
+  const leaves: any[] = await robustGet("/backend/leave-application");
+  const empLeaves = leaves.filter(l => l.manageEmployeeID === employeeId && l.status === "Approved");
+  let nonLoP = 0, lop = 0;
+  empLeaves.forEach(l => {
+    const ls = new Date(l.fromDate), le = new Date(l.toDate);
+    for (let d = new Date(ls); d <= le; d.setDate(d.getDate() + 1)) {
+      if (d >= start && d <= end) {
+        if (String(l.appliedLeaveType).toLowerCase() === "lop") lop++;
+        else nonLoP++;
+      }
+    }
+  });
+  return { nonLoPDays: nonLoP, lopDays: lop };
+}
+
+/** Get employee gross monthly salary from common fields */
+/** Get employee gross monthly salary from multiple possible sources (emp + grade) */
+function getGrossFromEmp(emp: any, grade?: any): number {
+  // 1) Preferred: nested monthlyPayGrade from backend include
+  if (emp?.monthlyPayGrade?.grossSalary) {
+    const v = Number(emp.monthlyPayGrade.grossSalary);
+    if (Number.isFinite(v) && v > 0) {
+      return v;
+    }
+  }
+
+  // 2) Fallbacks on employee object (many APIs use different names)
+  const fields = [
+    "monthlyGrossSalary", "grossSalary", "monthlySalary", "ctcMonthly",
+    "ctc", "salary", "totalSalary", "payrollSalary"
+  ];
+  for (const f of fields) {
+    const v = Number(emp?.[f]);
+    if (Number.isFinite(v) && v > 0) {
+      return v;
+    }
+  }
+
+  // 3) Final fallback: if we fetched Monthly Pay Grade separately
+  if (grade?.grossSalary) {
+    const v = Number(grade.grossSalary);
+    if (Number.isFinite(v) && v > 0) {
+      return v;
+    }
+  }
+
+  // Nothing found – show a precise alert to help you spot the data shape
+  throw new Error("Gross salary not found (expected on employee or monthly pay grade).");
+}
+
+
+/** Get total reimbursement amount for employee in selected period */
+/** Get total reimbursement amount for employee in selected period */
+/** Get total reimbursement amount for employee in selected period */
+async function getReimbursementAmount(employeeId: number, selectedMonthLabel: string): Promise<number> {
+  try {
+    const reimbursements: any[] = await robustGet(`${BACKEND_URL}/reimbursement`);
+
+    // Parse the selected salary period to get start and end dates
+    const { start: periodStart, end: periodEnd } = parseCycle(selectedMonthLabel);
+
+    // Filter reimbursements for this employee where the reimbursement date falls within salary period
+    const employeeReimbursements = reimbursements.filter(reimbursement => {
+      // Check if reimbursement has a date field
+      if (!reimbursement.date || typeof reimbursement.date !== 'string') return false;
+
+      try {
+        // Parse the reimbursement date (simple YYYY-MM-DD format)
+        const reimbDate = new Date(reimbursement.date);
+        if (isNaN(reimbDate.getTime())) return false;
+
+        // Check if reimbursement date falls within salary period
+        const overlaps = (
+          reimbDate >= periodStart &&
+          reimbDate <= periodEnd &&
+          reimbursement.manageEmployeeID === employeeId &&
+          reimbursement.status === "Approved" &&
+          reimbursement.approvalType === "Salary"
+        );
+
+
+        return overlaps;
+      } catch (error) {
+        console.error("Error parsing reimbursement date:", reimbursement.date, error);
+        return false;
+      }
+    });
+
+    if (employeeReimbursements.length === 0) {
+      return 0;
+    }
+
+    // Sum all amounts from all items across all matching reimbursements
+    let totalAmount = 0;
+
+    employeeReimbursements.forEach(reimbursement => {
+      if (reimbursement.items && Array.isArray(reimbursement.items)) {
+        reimbursement.items.forEach((item: any) => {
+          const amount = Number(item.amount) || 0;
+          totalAmount += amount;
+        });
+      }
+    });
+
+    return Math.round(totalAmount);
+
+  } catch (error) {
+    console.error("Error fetching reimbursements:", error);
+    return 0;
+  }
+}
+
+
+/** Compute earnings from Pay Grade + Reimbursements */
+async function computeEarnings(gross: number, grade: any, employeeId: number, selectedMonthLabel: string) {
+  const configured = Number(grade?.basicSalary ?? 0);
+  const pct = Number(grade?.percentageOfBasic ?? 0);
+  const basic = configured > 0
+    ? Math.round(configured)
+    : pct > 0
+      ? Math.round((gross * pct) / 100)
+      : (() => { throw new Error("Basic not set"); })();
+  const allowances: { name: string, amount: number }[] = [];
+  const list = grade?.monthlyPayGradeAllowanceList || [];
+
+  // Add regular allowances from pay grade
+  list.forEach((item: any) => {
+    const a = item.salaryAllowance || {};
+    const name = (a.salaryAllowanceName || "").trim();
+    const type = (a.salaryAllowanceType || "").toLowerCase();
+    const value = Number(a.salaryAllowanceValue || 0);
+    let amt = 0;
+    if (type === "fixed") amt = value;
+    else {
+      const base = name.toLowerCase().includes("hra") ? basic : gross;
+      amt = Math.round((base * value) / 100);
+    }
+    allowances.push({ name, amount: amt });
+  });
+
+  // Add reimbursements as a separate earning item
+  const reimbursementAmount = await getReimbursementAmount(employeeId, selectedMonthLabel);
+
+  // Create the final earnings array that includes both allowances and reimbursement
+  const earningsForPDF = [...allowances];
+
+  // Add reimbursement as a separate earning item if it exists
+  // Show reimbursement only when present (> 0)
+  if (reimbursementAmount > 0) {
+    earningsForPDF.push({
+      name: "Reimbursement",
+      amount: reimbursementAmount
+    });
+  }
+
+  const earningsTotal = basic + earningsForPDF.reduce((s, x) => s + x.amount, 0);
+
+  return {
+    basic,
+    allowances: earningsForPDF, // Return the updated array with reimbursement
+    earningsTotal
+  };
+}
+
+/** Compute grade deductions (PF % on Basic by name, otherwise % on Gross) */
+async function computeDeductions(
+  gross: number,
+  basic: number,
+  grade: any,
+  employeeId: number,
+  selectedMonthLabel: string
+) {
+  const list = grade?.monthlyPayGradeDeductionList || [];
+  const deductions: { name: string; amount: number }[] = [];
+
+  // Add regular deductions from pay grade
+  list.forEach((item: any) => {
+    const d = item.salaryDeduction || {};
+    const name = (d.salaryDeductionName || "").trim();
+    const amt = percentageDeductionAmount(d, basic, gross);
+    deductions.push({ name, amount: amt });
+  });
+
+  // Add salary advance repayments as deductions
+  const advanceRepayments = await getSalaryAdvanceRepayments(employeeId, selectedMonthLabel);
+  deductions.push(...advanceRepayments);
+
+  const deductionsTotal = deductions.reduce((s, x) => s + x.amount, 0);
+  return { deductions, deductionsTotal };
+}
+
+/* =======================
+   Attendance counter (MUST be above usage)
+   ======================= */
+
+async function fetchAllLogs(): Promise<any[]> {
+  const all: any[] = [];
+  try {
+    const res: any[] = await robustGet(`/backend/emp-attendance-logs`);
+    all.push(...res);
+  } catch (err) {
+    console.error("Failed to fetch /emp-attendance-logs", err);
+  }
+  return all;
+}
+
+async function calculateSalaryCounts(
+  employeeId: number,
+  monthLabel: string,
+  companyId: number,
+  branchId: number
+) {
+  try {
+
+    const monthNum = (name: string) => {
+      const months = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+      ];
+      const idx = months.findIndex(m => m.toLowerCase() === name.toLowerCase());
+      return String(idx + 1).padStart(2, "0");
+    };
+
+    const toMinutesMaybeHours = (v: any) => {
+      const n = Number(v ?? 0);
+      if (!Number.isFinite(n)) return 0;
+      return n <= 24 ? n * 60 : n;
+    };
+
+    const readNum = (obj: any, ...keys: string[]) => {
+      for (let k of keys) {
+        const raw = obj ? obj[k] : undefined;
+        if (raw !== undefined && raw !== null && !isNaN(Number(raw))) return Number(raw);
+      }
+      return undefined;
+    };
+
+    const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const dayName = (d: Date) => d.toLocaleString("en-US", { weekday: "long" });
+    const parseCDataTs = (s: string) => (!s ? new Date() : new Date(s.replace(" ", "T")));
+
+    // === EMPLOYEE ===
+    const empList: any[] = await robustGet(API.emp);
+    let emp = empList.find((e) => e.id === employeeId) ??
+      empList.find((e) => [e.employeeID, e.empId, e.employeeId].includes(employeeId as any));
+    if (!emp) throw new Error("Employee not found: " + employeeId);
+
+    // === PERIOD ===
+    let startDate: Date, endDate: Date;
+    if (monthLabel.includes(" to ")) {
+      const [l, r] = monthLabel.split(" to ");
+      const [sd, sm, sy] = l.trim().split(" ");
+      const [ed, em, ey] = r.trim().split(" ");
+      startDate = new Date(`${sy}-${monthNum(sm)}-${sd}T00:00:00`);
+      endDate = new Date(`${ey}-${monthNum(em)}-${ed}T23:59:59`);
+    } else {
+      const [mn, yr] = monthLabel.trim().split(" ");
+      const mNum = monthNum(mn);
+      startDate = new Date(`${yr}-${mNum}-01T00:00:00`);
+      endDate = new Date(Number(yr), Number(mNum), 0, 23, 59, 59);
+    }
+
+    // === ATTENDANCE POLICY ===
+    const policies: any[] = await robustGet("/backend/attendance-policy");
+    const policy = policies.find((p: any) => p.id === emp.attendancePolicyID) ?? {};
+    const workingType = (policy?.workingHoursType ?? "").toLowerCase();
+    const isFlexible = workingType.includes("flex");
+    const checkinBeginBeforeMin = readNum(policy, "checkin_begin_before_min", "checkinBeginBeforeMin") ?? 0;
+    const checkoutEndAfterMin = readNum(policy, "checkout_end_after_min", "checkoutEndAfterMin") ?? 0;
+    const checkinGraceMin = readNum(policy, "checkin_grace_time_min", "checkinGraceTimeMin") ?? 0;
+    const earlyCheckoutBeforeEndMin = readNum(policy, "early_checkout_before_end_min", "earlyCheckoutBeforeEndMin") ?? 0;
+    const maxLateCheckInMin = readNum(policy, "max_late_check_in_time", "maxLateCheckInTime") ?? 0;
+    const halfDayMin = toMinutesMaybeHours(readNum(policy, "min_work_hours_half_day_min", "minWorkHoursHalfDayMin") ?? 0);
+    const lateMarkCount = Number(policy?.lateMarkCount ?? 0);
+    const markAsAction = (policy?.markAs ?? "Half Day").toString().toLowerCase();
+
+    // === SHIFT ===
+    const workShifts: any[] = await robustGet("/backend/work-shift");
+    const empShift = workShifts.find((ws: any) => ws.id === emp.workShiftID);
+    if (!empShift) return null;
+    const shiftDays: any[] = empShift.workShiftDay ?? [];
+    const weeklyOffDays = new Set(shiftDays.filter((d: any) => d.weeklyOff).map((d: any) => d.weekDay));
+
+    const getShiftFrame = (d: Date) => {
+      const dayOfWeek = dayName(d);
+      const sd = shiftDays.find((x: any) => x.weekDay === dayOfWeek);
+      if (!sd) return null;
+      const st = new Date(sd.startTime), et = new Date(sd.endTime);
+      const shiftStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), st.getUTCHours(), st.getUTCMinutes());
+      let shiftEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), et.getUTCHours(), et.getUTCMinutes());
+      if (shiftEnd <= shiftStart) shiftEnd.setDate(shiftEnd.getDate() + 1);
+      const earliestIn = new Date(shiftStart.getTime() - checkinBeginBeforeMin * 60000);
+      const latestOut = new Date(shiftEnd.getTime() + checkoutEndAfterMin * 60000);
+      const graceEnd = new Date(shiftStart.getTime() + checkinGraceMin * 60000);
+      const lateEnd = new Date(shiftStart.getTime() + (checkinGraceMin + maxLateCheckInMin) * 60000);
+      const earlyOutStart = new Date(shiftEnd.getTime() - earlyCheckoutBeforeEndMin * 60000);
+      const wallMinutes = Math.round((shiftEnd.getTime() - shiftStart.getTime()) / 60000);
+      const fullMinutes = shiftNetMinutes(sd.totalMinutes, wallMinutes);
+      return { shiftStart, shiftEnd, earliestIn, latestOut, graceEnd, lateEnd, earlyOutStart, fullMinutes, weekDay: sd.weekDay };
+    };
+
+    // === HOLIDAY / LEAVE / REGULARISE MAPS ===
+    const holidays: any[] = await robustGet("/backend/public-holiday");
+    const branchHolidays = holidays.filter((h: any) => h.branchesID === branchId);
+    const holidaySet = new Set<string>();
+    for (const h of branchHolidays) {
+      const hs = new Date(h.startDate), he = new Date(h.endDate);
+      for (let d = new Date(hs); d <= he; d.setDate(d.getDate() + 1)) if (d >= startDate && d <= endDate) holidaySet.add(ymd(d));
+    }
+
+    const leaves: any[] = await robustGet("/backend/leave-application");
+    const empLeaves = leaves.filter((l) => Number(l.manageEmployeeID) === Number(employeeId));
+
+    const regs: any[] = await robustGet("/backend/emp-attendance-regularise");
+    const empRegs = regs.filter((r) => Number(r.manageEmployeeID) === Number(employeeId) && r.status === "Approved");
+
+    // === LOGS ===
+    const allLogs = await fetchAllLogs();
+    const logs = allLogs.filter((l: any) => String(l.employeeID) === String(emp.id) || String(l.employeeID) === String(emp.employeeID))
+      .map((l: any) => ({ ...l, t: parseCDataTs(l.punchTimeStamp) }))
+      .filter((l: any) => l.t >= startDate && l.t <= endDate)
+      .sort((a: any, b: any) => a.t.getTime() - b.t.getTime());
+    const logsByDate = new Map<string, Date[]>();
+    for (const l of logs) {
+      const key = ymd(l.t);
+      if (!logsByDate.has(key)) logsByDate.set(key, []);
+      logsByDate.get(key)!.push(l.t);
+    }
+
+    // === COUNTERS ===
+    let flex_fullDayPresent = 0, flex_halfDayPresent = 0, flex_absent = 0, lateMarksUsed = 0;
+
+    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+      const key = ymd(d);
+      const todayWeekDay = dayName(d);
+
+      let leaveEffect: "paid" | "unpaid" | null = null;
+      for (const lv of empLeaves) {
+        const effect = leaveDayPay(lv, key);
+        if (effect) { leaveEffect = effect; break; }
+      }
+      if (leaveEffect === "paid") { flex_fullDayPresent++; continue; }
+      if (leaveEffect === "unpaid") { flex_absent++; continue; }
+
+      const reg = empRegs.find((r) => calendarDateKey(r.attendanceDate) === key);
+      const regPay = reg ? regularisationPay(reg.requestedStatus) : null;
+      if (regPay === "half") { flex_halfDayPresent++; continue; }
+      if (regPay === "absent") { flex_absent++; continue; }
+      if (regPay) { flex_fullDayPresent++; continue; }
+
+      if (holidaySet.has(key)) { flex_fullDayPresent++; continue; }
+      if (weeklyOffDays.has(todayWeekDay)) { flex_fullDayPresent++; continue; }
+
+      const frame = getShiftFrame(d);
+      if (!frame) continue;
+
+      const dayLogs = (logsByDate.get(key) || []).filter(t => t >= frame.earliestIn && t <= frame.latestOut);
+      let dayStatus: "full" | "half" | "absent" = "absent";
+
+      // === FLEXIBLE WORKING LOGIC ===
+      if (isFlexible) {
+        if (dayLogs.length < 2) {
+          dayStatus = "absent";
+        } else {
+          dayLogs.sort((a, b) => a.getTime() - b.getTime());
+          const totalWorkedMinutes = Math.round((dayLogs[dayLogs.length - 1].getTime() - dayLogs[0].getTime()) / 60000);
+          dayStatus = halfDayMin > 0 && totalWorkedMinutes <= halfDayMin ? "half" : "full";
+        }
+      }
+      // === FIXED WORKING LOGIC ===
+      else {
+        if (dayLogs.length >= 2) {
+          dayLogs.sort((a, b) => a.getTime() - b.getTime());
+          const totalWorkedMinutes = Math.round((dayLogs[dayLogs.length - 1].getTime() - dayLogs[0].getTime()) / 60000);
+          const firstPunch = dayLogs[0];
+          const isLateMark = firstPunch > frame.graceEnd && firstPunch <= frame.lateEnd;
+          const isVeryLate = firstPunch > frame.lateEnd;
+
+          if (halfDayMin > 0 && totalWorkedMinutes <= halfDayMin) dayStatus = "half";
+          else if (isVeryLate) dayStatus = "half";
+          else {
+            let todayViolations = 0;
+            if (isLateMark) todayViolations++;
+            if (todayViolations > 0 && lateMarkCount > 0) {
+              if (lateMarksUsed + todayViolations >= lateMarkCount) {
+                dayStatus = markAsAction.includes("absent") ? "absent" : "half";
+                lateMarksUsed = 0;
+              } else {
+                lateMarksUsed += todayViolations;
+                dayStatus = "full";
+              }
+            } else dayStatus = "full";
+          }
+        } else {
+          dayStatus = "absent";
+        }
+      }
+
+      if (dayStatus === "full") flex_fullDayPresent++;
+      else if (dayStatus === "half") flex_halfDayPresent++;
+      else flex_absent++;
+    }
+
+    const totalDays = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
+    return { startDate: startDate.toDateString(), endDate: endDate.toDateString(), totalDays, flex_fullDayPresent, flex_halfDayPresent, flex_absent, lateMarksUsed, lateMarkCount };
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+
+/* =======================
+   PDF generation
+   ======================= */
+
+
+function numberToWords(num: number): string {
+  const a = [
+    "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+    "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"
+  ];
+  const b = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+
+  const inWords = (n: number): string => {
+    if (n < 20) return a[n];
+    if (n < 100) return b[Math.floor(n / 10)] + (n % 10 ? " " + a[n % 10] : "");
+    if (n < 1000) return a[Math.floor(n / 100)] + " Hundred " + inWords(n % 100);
+    if (n < 100000) return inWords(Math.floor(n / 1000)) + " Thousand " + inWords(n % 1000);
+    if (n < 10000000) return inWords(Math.floor(n / 100000)) + " Lakh " + inWords(n % 100000);
+    return inWords(Math.floor(n / 10000000)) + " Crore " + inWords(n % 10000000);
+  };
+
+  return inWords(Math.floor(num)) + " Rupees Only";
+}
+
+
+
+function downloadSalarySlipPDF(payload: {
+  companyName: string;
+  branchName: string;
+  employee: any;
+  monthLabel: string;
+  start: Date;
+  end: Date;
+  cycleDays: number;
+  paidUnits: number;
+  lopDays: number;
+  nonLoPLeaveDays: number;
+  weeklyOffDays: number;
+  holidays: number;
+  halfDaysUnits: number;
+  gross: number;
+  basic: number;
+  earnings: { name: string; amount: number }[];
+  deductions: { name: string; amount: number }[];
+  lopAmount: number;
+  earningsTotal: number;
+  deductionsTotal: number;
+  netPay: number;
+}) {
+
+  function numberToWords(amount: number): string {
+    const ones = [
+      "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+      "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen",
+      "Sixteen", "Seventeen", "Eighteen", "Nineteen"
+    ];
+    const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+
+    function numToWords(n: number): string {
+      if (n < 20) return ones[n];
+      if (n < 100) return tens[Math.floor(n / 10)] + (n % 10 ? " " + ones[n % 10] : "");
+      if (n < 1000) return ones[Math.floor(n / 100)] + " Hundred" + (n % 100 ? " and " + numToWords(n % 100) : "");
+      if (n < 100000) return numToWords(Math.floor(n / 1000)) + " Thousand" + (n % 1000 ? " " + numToWords(n % 1000) : "");
+      if (n < 10000000) return numToWords(Math.floor(n / 100000)) + " Lakh" + (n % 100000 ? " " + numToWords(n % 100000) : "");
+      return numToWords(Math.floor(n / 10000000)) + " Crore" + (n % 10000000 ? " " + numToWords(n % 10000000) : "");
+    }
+
+    const [rupees, paise] = amount.toFixed(2).split(".").map(Number);
+    let words = `Rupees ${numToWords(rupees)}`;
+    if (paise > 0) words += ` and ${numToWords(paise)} Paise`;
+    return words + " Only";
+  }
+
+  try {
+    // ========== HEADER ==========
+    const doc = new jsPDF("p", "mm", "a4");
+    const pageWidth = doc.internal.pageSize.width;
+    const gray: [number, number, number] = [100, 60, 150];
+    let y = 15;
+
+    const companyName = payload.companyName || payload.employee?.company?.companyName;
+    const companyAddress = payload.employee?.company?.address || "Head Office";
+
+
+    // Company Name
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(15);
+    doc.setTextColor(gray[0], gray[1], gray[2]);
+    doc.text(companyName, pageWidth / 2, 20, { align: "center" });
+
+    // Address line (below company name)
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(80, 80, 80);
+    doc.text(companyAddress, pageWidth / 2, 25, { align: "center" });
+
+    // Tagline
+    doc.setFontSize(8);
+    doc.setTextColor(100, 100, 100);
+
+    // Salary Slip Title
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(0, 0, 0);
+    doc.text("Salary Slip", pageWidth / 2, 38, { align: "center" });
+
+    // Branch & Period
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.text(`Branch: ${payload.branchName}`, 15, 45);
+    const periodLabel = formatPayslipPeriodLabel(
+      payload.monthLabel,
+      payload.start,
+      payload.end,
+    );
+    doc.text(`Period: ${periodLabel}`, pageWidth - 15, 45, { align: "right" });
+
+    // ========== EMPLOYEE DETAILS ==========
+    const empName = `${payload.employee.employeeFirstName || ""} ${payload.employee.employeeLastName || ""}`.trim();
+    const dept = payload.employee.departments?.departmentName || "N/A";
+    const desg = payload.employee.designations?.designation || "N/A";
+
+    // CORRECTED: Calculate actual paid days (Total Cycle - LOP Days)
+    const actualPaidDays = payload.cycleDays - payload.lopDays;
+
+    // Validate that the calculation makes sense
+    if (actualPaidDays < 0) {
+      console.warn("Invalid paid days calculation: LOP days exceed cycle days");
+    }
+
+    autoTable(doc, {
+      startY: 47,
+      theme: "grid",
+      styles: { fontSize: 9, cellPadding: 2, lineWidth: 0.1 },
+      headStyles: { fillColor: gray, textColor: [255, 255, 255], halign: "center" },
+      body: [
+        ["Employee ID", payload.employee.employeeID || "-", "Name", empName],
+        ["Department", dept, "designation", desg],
+        ["Total Paid Days", actualPaidDays.toFixed(2), "Approved Leaves", payload.nonLoPLeaveDays],
+        ["Cycle Days", payload.cycleDays, "LOP Days", payload.lopDays.toFixed(2)],
+      ],
+      columnStyles: {
+        0: { cellWidth: 30 },
+        1: { cellWidth: 60 },
+        2: { cellWidth: 30 },
+        3: { cellWidth: 60 },
+      },
+      margin: { left: 15 },
+      tableWidth: pageWidth - 30,
+    });
+
+    y = (doc as any).lastAutoTable.finalY + 5;
+
+    // ========== EARNINGS / DEDUCTIONS ==========
+    const earningsRows = [
+      ["Basic Pay", ` ${payload.basic.toFixed(2)}`],
+      ...payload.earnings.map((e: any) => [e.name, ` ${e.amount.toFixed(2)}`]),
+      ["Total Earnings", ` ${payload.earningsTotal.toFixed(2)}`],
+    ];
+    const dedRows = [
+      ...payload.deductions.map((d: any) => [d.name, ` ${d.amount.toFixed(2)}`]),
+      ["Loss of Pay", ` ${payload.lopAmount.toFixed(2)}`],
+      ["Total Deductions", ` ${(payload.deductionsTotal + payload.lopAmount).toFixed(2)}`],
+    ];
+
+    autoTable(doc, {
+      startY: y,
+      theme: "grid",
+      styles: { fontSize: 9, lineWidth: 0.1 },
+      headStyles: { fillColor: gray, textColor: [255, 255, 255], halign: "center" },
+      head: [
+        [
+          { content: "Earnings", colSpan: 2, styles: { halign: "center" } },
+          { content: "Deductions", colSpan: 2, styles: { halign: "center" } },
+        ],
+      ],
+      body: (() => {
+        const rows: any[] = [];
+        const max = Math.max(earningsRows.length, dedRows.length);
+        for (let i = 0; i < max; i++) {
+          rows.push([
+            earningsRows[i]?.[0] || "",
+            earningsRows[i]?.[1] || "",
+            dedRows[i]?.[0] || "",
+            dedRows[i]?.[1] || "",
+          ]);
+        }
+        return rows;
+      })(),
+      columnStyles: {
+        0: { cellWidth: 40 },
+        1: { cellWidth: 40 },
+        2: { cellWidth: 40 },
+        3: { cellWidth: 40 },
+      },
+      margin: { left: 15 },
+      tableWidth: pageWidth - 30,
+    });
+
+    y = (doc as any).lastAutoTable.finalY + 5;
+
+    // ========== NET PAY SECTION ==========
+    autoTable(doc, {
+      startY: y,
+      theme: "grid",
+      styles: { fontSize: 10, lineWidth: 0.1, halign: "center" },
+      headStyles: { fillColor: gray, textColor: [255, 255, 255] },
+      head: [["Net Pay (Rounded)", "Amount"]],
+      body: [[`Net Payable`, ` ${payload.netPay.toFixed(0)}`]],
+      margin: { left: 15 },
+      tableWidth: pageWidth - 30,
+    });
+
+    y = (doc as any).lastAutoTable.finalY + 8;
+
+    // ========== NET PAY IN WORDS ==========
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(9);
+    doc.text(
+      `Net Payable (in words): ${numberToWords(payload.netPay)}`, // This will use the rounded value
+      15,
+      y
+    );
+
+    // ========== DAYS BREAKDOWN ==========
+    y += 15;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(100, 100, 100);
+    doc.text(`Days Breakdown: Total Cycle (${payload.cycleDays}) - LOP Days (${payload.lopDays.toFixed(2)}) = Paid Days (${actualPaidDays.toFixed(2)})`, 15, y);
+
+    // ========== SIGNATURES ==========
+    y += 20;
+    doc.setDrawColor(0);
+    const empSigLineStart = pageWidth - 80;
+    const empSigLineEnd = pageWidth - 30;
+    doc.line(30, y, 80, y);
+    doc.line(empSigLineStart, y, empSigLineEnd, y);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.text("Employer's Signature", 55, y + 5, { align: "center" });
+    doc.text(
+      "Employee's Signature",
+      (empSigLineStart + empSigLineEnd) / 2,
+      y + 5,
+      { align: "center" },
+    );
+
+    // ========== FOOTER ==========
+    y += 15;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(100);
+    doc.text("This is a system generated document.", pageWidth / 2, y, { align: "center" });
+    doc.text(`Generated on: ${new Date().toLocaleDateString("en-IN")}`, pageWidth / 2, y + 4, { align: "center" });
+
+    // ========== SAVE ==========
+    const fn = `Salary_Slip_${payload.employee.employeeID || payload.employee.id}_${payload.start.getFullYear()}_${(
+      payload.start.getMonth() + 1
+    )
+      .toString()
+      .padStart(2, "0")}.pdf`;
+    doc.save(fn);
+  }
+  catch (err) {
+    console.error("Error generating salary slip:", err);
+    throw err;
+  }
+}
+
+/** Download payslip PDF — uses the same calculation as the admin Generate Salary page. */
+export async function downloadPayslipForSalaryRow(row: GenerateSalaryRow) {
+  const { computeSalarySlipForRow, downloadSalarySlipPDF } = await import(
+    "../generate-salary/GenerateSalaryManagement"
+  );
+  const computed = await computeSalarySlipForRow(row as Parameters<typeof computeSalarySlipForRow>[0]);
+  downloadSalarySlipPDF({
+    ...computed,
+    perDayGross: computed.perDayGross || 0,
+    perDayBasic: computed.perDayBasic || 0,
+    proRatedGross: computed.proRatedGross || 0,
+    totalWorkingDaysInCycle: computed.totalWorkingDaysInCycle || 0,
+  });
+}
+
+/* =======================
+   Component
+   ======================= */
+
+export function EmpGenerateSalary() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  // table + UI
+  const [searchTerm, setSearchTerm] = useState("");
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [editing, setEditing] = useState<GenerateSalaryRow | null>(null);
+  const [salaryPeriod, setSalaryPeriod] = useState("");
+
+const user = useCurrentUser()
+const [items, setItems] = useState<GenerateSalaryRow[]>(() => getPageCache<GenerateSalaryRow[]>("empPayslips") ?? [])
+const canManage = user?.role === "SUPERADMIN" || user?.role === "SERVICE_PROVIDER" || isCompanyAdminLikeRole(user?.role) || user?.role === "BRANCH_ADMIN"
+
+  // suggestion states
+  const [spList, setSpList] = useState<SP[]>([]);
+  const [coList, setCoList] = useState<CO[]>([]);
+  const [brList, setBrList] = useState<BR[]>([]);
+  const [empList, setEmpList] = useState<Emp[]>([]);
+  const [spLoading, setSpLoading] = useState(false);
+  const [coLoading, setCoLoading] = useState(false);
+  const [brLoading, setBrLoading] = useState(false);
+  const [empLoading, setEmpLoading] = useState(false);
+  const spRef = useRef<HTMLDivElement | null>(null);
+  const coRef = useRef<HTMLDivElement | null>(null);
+  const brRef = useRef<HTMLDivElement | null>(null);
+  const empRef = useRef<HTMLDivElement | null>(null);
+
+  // company-driven salary cycle
+  const [selectedCompanyFYStart, setSelectedCompanyFYStart] = useState<string | null>(null);
+  const [selectedCompanyStartDay, setSelectedCompanyStartDay] = useState<string>("1");
+  const [salaryPeriodOptions, setSalaryPeriodOptions] = useState<string[]>([]);
+  const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
+  const [selectedSalaryRow, setSelectedSalaryRow] = useState<GenerateSalaryRow | null>(null);
+
+  // Payment form
+  const [paymentMode, setPaymentMode] = useState<string>("Cash");
+  const [paymentType, setPaymentType] = useState<string>("Cash");
+  const [paymentDate, setPaymentDate] = useState<string>("");
+  const [paymentRemark, setPaymentRemark] = useState<string>("");
+  const [paymentProof, setPaymentProof] = useState<string>("");
+  const [employeeBankDetails, setEmployeeBankDetails] = useState<any | null>(null);
+  const [isLoadingBankDetails, setIsLoadingBankDetails] = useState(false);
+
+
+  async function openPaymentDialog(row: GenerateSalaryRow) {
+  setSelectedSalaryRow(row);
+  setIsPaymentDialogOpen(true);
+  setPaymentMode("Cash");
+  setPaymentType("Cash");
+  setPaymentDate(new Date().toISOString().split("T")[0]);
+  setPaymentRemark("");
+  setPaymentProof("");
+  setEmployeeBankDetails(null);
+
+  if (row.manageEmployee?.id) {
+    try {
+      setIsLoadingBankDetails(true);
+
+      // ✅ Fetch from manage-emp and find employee by ID
+      const allEmployees = await robustGet("/backend/manage-emp");
+      const employee = allEmployees.find((e: any) => e.id === row.manageEmployee?.id);
+
+      // Extract the first bank details entry if exists
+      if (employee && employee.employeeBankDetails?.length > 0) {
+        const bankDetails = employee.employeeBankDetails[0];
+        setEmployeeBankDetails(bankDetails);
+
+        // ✅ Auto-select paymentType if UPI exists
+        if (bankDetails.upi) {
+          setPaymentMode("Bank");
+          setPaymentType("UPI");
+        }
+      } else {
+        setEmployeeBankDetails(null);
+      }
+
+    } catch (err) {
+      console.error("Error fetching employee bank details from manage-emp:", err);
+    } finally {
+      setIsLoadingBankDetails(false);
+    }
+  }
+}
+
+
+  async function handlePaymentSubmit(e?: React.FormEvent) {
+  if (e) e.preventDefault();
+  if (!selectedSalaryRow) return;
+
+  // Keep existing data + add payment fields
+  const payload = {
+    ...selectedSalaryRow, // keep everything that already exists
+    paymentMode,
+    paymentType,
+    paymentDate,
+    paymentRemark,
+    paymentProof,
+  };
+
+  // Remove nested relations before sending to API (optional but clean)
+  delete payload.manageEmployee;
+  delete payload.serviceProvider;
+  delete payload.company;
+  delete payload.branches;
+
+  try {
+    const res = await fetch(`/backend/generate-salary/${selectedSalaryRow.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) throw new Error(await res.text());
+    setIsPaymentDialogOpen(false);
+    fetchAll(); // reload table
+  } catch (error) {
+    console.error("Payment update failed:", error);
+  }
+}
+
+
+  // form
+  const [formData, setFormData] = useState({
+    serviceProviderID: null as number | null,
+    companyID: null as number | null,
+    branchesID: null as number | null,
+    spAutocomplete: "",
+    coAutocomplete: "",
+    brAutocomplete: "",
+    employeeDbID: null as number | null,
+    employeeAutocomplete: "",
+    monthLabel: "",
+  });
+
+  useEffect(() => {
+    if (!user) return;
+    const scoped =
+      resolveScopedCompanyId(user) ?? getActiveCompanyId() ?? user.companyID ?? null;
+    if (!scoped) return;
+    setFormData((prev) => {
+      if (prev.companyID) return prev;
+      const ctx = getSidebarContext();
+      return {
+        ...prev,
+        companyID: scoped,
+        coAutocomplete: prev.coAutocomplete || ctx?.companyName || "",
+      };
+    });
+  }, [user]);
+
+  // close popovers on outside click
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (spRef.current && !spRef.current.contains(t)) setSpList([]);
+      if (coRef.current && !coRef.current.contains(t)) setCoList([]);
+      if (brRef.current && !brRef.current.contains(t)) setBrList([]);
+      if (empRef.current && !empRef.current.contains(t)) setEmpList([]);
+    };
+    document.addEventListener("click", onDocClick);
+    return () => document.removeEventListener("click", onDocClick);
+  }, []);
+
+  useEffect(() => {
+    if (formData.companyID) {
+      (async () => {
+        const res = await robustGet("/backend/salary-cycle");
+        const filtered = res
+          .filter((c: any) => c.companyID === Number(formData.companyID))
+          .map((c: any) => `${c.startDay} ${c.startMonth} ${c.startYear} to ${c.endDay} ${c.endMonth} ${c.endYear}`);
+        setSalaryPeriodOptions(filtered);
+      })();
+    }
+  }, [formData.companyID]);
+
+
+  /* ====== CRUD ====== */
+  async function fetchAll() {
+  try {
+    const raw = await robustGet(API.generateSalary)
+    const allItems: GenerateSalaryRow[] = Array.isArray(raw) ? raw : (raw?.data ?? [])
+
+    // === SUPERADMIN → all entries
+    if (user?.role === "SUPERADMIN") {
+      setItems(allItems)
+      return
+    }
+
+    // === MANAGER → match companyID + branchesID from /users
+    if (user?.role === "SERVICE_PROVIDER") {
+      const ctx = getSidebarContext()
+      if (ctx?.companyID) {
+        setItems(allItems.filter((r: any) => r.companyID === ctx.companyID))
+        return
+      }
+      const users = await robustGet(`${BACKEND_URL}/users`)
+      const currentUser = users.find((u: any) => u.username === user.username)
+      if (currentUser?.serviceProviderID) {
+        setItems(allItems.filter((r: any) => r.serviceProviderID === currentUser.serviceProviderID))
+        return
+      }
+    }
+
+   // === EMPLOYEE → only own entries that are already Paid ===
+const creds = await robustGet(`${BACKEND_URL}/manage-emp/credentials/all`);
+const emp = user ? creds.find((c: any) => c.username === user.username) : null;
+
+if (emp) {
+  const filtered = allItems.filter((r: any) =>
+    r.companyID === emp.companyID &&
+    r.branchesID === emp.branchesID &&
+    (
+      // match employee linkage (cover both shapes your API might return)
+      r.manageEmployeeID === emp.employeeID ||
+      r.manageEmployee?.id === emp.employeeID ||
+      r.employeeID === emp.employeeID
+    ) &&
+    (r.status === "Approved" || r.status === "Paid")
+  );
+  setPageCache("empPayslips", filtered);
+  setItems(filtered);
+} else {
+  setItems([]);
+}
+
+  } catch (e) {
+    console.error("Failed to load GenerateSalary:", e)
+  }
+}
+
+useEffect(() => {
+  if (user) fetchAll()
+}, [user])
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!formData.employeeDbID || !formData.monthLabel) return;
+
+    const payload: GenerateSalaryDTO = {
+      serviceProviderID: formData.serviceProviderID ?? undefined,
+      companyID: formData.companyID ?? undefined,
+      branchesID: formData.branchesID ?? undefined,
+      employeeID: formData.employeeDbID,
+      monthPeriod: formData.monthLabel
+    };
+
+    try {
+      const res = await fetch(
+        editing ? `${API.generateSalary}/${editing.id}` : API.generateSalary,
+        {
+          method: editing ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await fetchAll();
+      resetForm();
+      setIsDialogOpen(false);
+    } catch (err) {
+      console.error("Save failed:", err);
+    }
+  }
+
+  async function handleDelete(id: number) {
+    if (!confirm("Delete this record?")) return;
+    try {
+      const res = await fetch(`${API.generateSalary}/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await fetchAll();
+    } catch (e) {
+      console.error("Delete failed:", e);
+    }
+  }
+
+  function resetForm() {
+    const ctx = getSidebarContext();
+    const scopedCompanyID =
+      resolveScopedCompanyId(user) ??
+      getActiveCompanyId() ??
+      ctx?.companyID ??
+      user?.companyID ??
+      null;
+    setFormData({
+      serviceProviderID: ctx?.serviceProviderID ?? null,
+      companyID: scopedCompanyID,
+      branchesID: null,
+      spAutocomplete: ctx?.serviceProviderName ?? "",
+      coAutocomplete: ctx?.companyName ?? "",
+      brAutocomplete: "",
+      employeeDbID: null,
+      employeeAutocomplete: "",
+      monthLabel: "",
+    });
+    setEditing(null);
+    setSelectedCompanyFYStart(null);
+    setSelectedCompanyStartDay("1");
+    setSalaryPeriodOptions([]);
+    setSpList([]); setCoList([]); setBrList([]); setEmpList([]);
+  }
+
+  async function beginEdit(row: GenerateSalaryRow) {
+    setEditing(row);
+
+    // Set all form data first
+    const newFormData = {
+      serviceProviderID: row.serviceProviderID ?? null,
+      companyID: row.companyID ?? null,
+      branchesID: row.branchesID ?? null,
+      spAutocomplete: row.serviceProvider?.companyName ?? "",
+      coAutocomplete: row.company?.companyName ?? "",
+      brAutocomplete: row.branches?.branchName ?? "",
+      employeeDbID: row.employeeID ?? null,
+      employeeAutocomplete: row.manageEmployee ? `${empName(row.manageEmployee)} (${row.manageEmployee.employeeID ?? ""})` : "",
+      monthLabel: row.monthPeriod,
+    };
+
+    setFormData(newFormData);
+
+    // Now refresh company options if company exists
+    if (row.companyID) {
+      try {
+        await refreshCompanyDrivenOptions(row.companyID);
+      } catch (error) {
+        console.error("Failed to refresh company options:", error);
+      }
+    } else {
+      setSelectedCompanyFYStart(null);
+    }
+    if (row.employeeID) {
+      await loadEmployeeSalaryPeriods(row.employeeID);
+    } else {
+      setSelectedCompanyStartDay("");
+      setSalaryPeriodOptions([]);
+    }
+
+    setIsDialogOpen(true);
+  }
+
+
+  /* ====== Suggestions ====== */
+  const runFetchSP = async (q: string) => {
+    if (!q || q.length < MIN_CHARS) return setSpList([]);
+    setSpLoading(true);
+    try {
+      const data: SP[] = await robustGet(API.sp);
+      const filtered = data.filter((sp) => (sp.companyName ?? "").toLowerCase().includes(q.toLowerCase()));
+      setSpList(filtered);
+    } catch { /* noop */ }
+    finally { setSpLoading(false); }
+  };
+
+  const runFetchCO = async (q: string) => {
+    if (!q || q.length < MIN_CHARS) return setCoList([]);
+    setCoLoading(true);
+    try {
+      const data: CO[] = await robustGet(API.co);
+      const filtered = data.filter((co) => (co.companyName ?? "").toLowerCase().includes(q.toLowerCase()));
+      setCoList(filtered);
+    } catch { /* noop */ }
+    finally { setCoLoading(false); }
+  };
+
+  const runFetchBR = async (q: string) => {
+    setBrLoading(true);
+    try {
+      const scoped =
+        formData.companyID ??
+        resolveScopedCompanyId(user) ??
+        getActiveCompanyId() ??
+        user?.companyID ??
+        null;
+      const url = scoped ? `${API.br}?companyID=${scoped}` : API.br;
+      const data: BR[] = await robustGet(url);
+      const byCompany = scoped
+        ? data.filter((b) => Number(b.companyID) === Number(scoped))
+        : data;
+      const filtered = (q?.length
+        ? byCompany.filter((b) => (b.branchName ?? "").toLowerCase().includes(q.toLowerCase()))
+        : byCompany);
+      setBrList(filtered);
+    } catch { /* noop */ }
+    finally { setBrLoading(false); }
+  };
+
+  const runFetchEmp = async (q: string) => {
+    if (!q || q.length < MIN_CHARS) return setEmpList([]);
+    setEmpLoading(true);
+    try {
+      const data: Emp[] = await robustGet(API.emp);
+      const low = q.toLowerCase();
+      const filtered = data.filter((e) =>
+        (empName(e)).toLowerCase().includes(low) ||
+        (e.employeeID ?? "").toLowerCase().includes(low)
+      );
+      setEmpList(filtered);
+    } catch { /* noop */ }
+    finally { setEmpLoading(false); }
+  };
+
+  async function refreshCompanyDrivenOptions(companyId: number) {
+    try {
+      const company: CO = await robustGet(`${API.co}/${companyId}`);
+      setSelectedCompanyFYStart(company?.financialYearStart ?? "1st April");
+    } catch (e) {
+      console.error("Failed to refresh company options:", e);
+      setSelectedCompanyFYStart(null);
+    }
+  }
+
+  async function loadEmployeeSalaryPeriods(employeeId: number) {
+    try {
+      const data = await robustGet(`/backend/salary-cycle/employee/${employeeId}/periods`);
+      const periods: string[] = Array.isArray(data?.periods) ? data.periods : [];
+      setSalaryPeriodOptions(periods);
+      setSelectedCompanyStartDay(data?.monthStartDay ? String(data.monthStartDay) : "");
+      if (data?.financialYearStart) setSelectedCompanyFYStart(data.financialYearStart);
+      setFormData((p) => (periods.includes(p.monthLabel) ? p : { ...p, monthLabel: "" }));
+    } catch (e) {
+      console.error("Failed to load employee salary periods:", e);
+      toast.error("Could not load this employee's salary cycle.");
+      setSalaryPeriodOptions([]);
+      setSelectedCompanyStartDay("");
+      setFormData((p) => ({ ...p, monthLabel: "" }));
+    }
+  }
+
+  const downloadHandledRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      sessionStorage.removeItem("empPayslipAutoDownload");
+    }
+  }, []);
+
+  useEffect(() => {
+    const downloadParam = searchParams.get("download");
+    if (!downloadParam || !user || downloadHandledRef.current) return;
+    const idNum = Number(downloadParam);
+    if (!Number.isFinite(idNum)) return;
+
+    downloadHandledRef.current = true;
+
+    (async () => {
+      let row = items.find((r) => r.id === idNum);
+      if (!row) {
+        try {
+          row = await robustGet(`${BACKEND_URL}/generate-salary/${idNum}`);
+        } catch {
+          row = undefined;
+        }
+      }
+      if (!row) {
+        toast.error("Could not load payslip for download");
+        router.replace("/empGenerateSalary");
+        return;
+      }
+      try {
+        await downloadPayslipForSalaryRow(row);
+        toast.success("Payslip downloaded");
+      } catch (err) {
+        console.error("Payslip download failed:", err);
+        toast.error("Download failed. Check attendance/shift setup and try again.");
+      } finally {
+        router.replace("/empGenerateSalary");
+      }
+    })();
+  }, [searchParams, user, items, router]);
+
+  /* ====== Filter for table ====== */
+  const filtered = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter((g) =>
+      (g.serviceProvider?.companyName ?? "").toLowerCase().includes(q) ||
+      (g.company?.companyName ?? "").toLowerCase().includes(q) ||
+      (g.branches?.branchName ?? "").toLowerCase().includes(q) ||
+      empName(g.manageEmployee).toLowerCase().includes(q) ||
+      (g.monthPeriod ?? "").toLowerCase().includes(q)
+    );
+  }, [items, searchTerm]);
+
+  /* =======================
+     UI
+     ======================= */
+  return (
+    <>
+
+
+<Dialog open={isPaymentDialogOpen} onOpenChange={setIsPaymentDialogOpen}>
+  <DialogContent>
+    <DialogHeader className="px-6 py-4 border-b bg-white sticky top-0 z-10">
+      <DialogTitle className="text-xl font-semibold text-green-800">
+        Make Payment
+      </DialogTitle>
+    </DialogHeader>
+
+    <div className="flex-1 overflow-y-auto px-6 py-4">
+      {selectedSalaryRow && (
+        <form onSubmit={handlePaymentSubmit} className="space-y-6">
+          {/* Employee Info */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
+            <div>
+              <Label>Employee</Label>
+              <p className="font-semibold">{empName(selectedSalaryRow.manageEmployee)}</p>
+            </div>
+            <div>
+              <Label>Month</Label>
+              <p className="font-semibold">{selectedSalaryRow.monthPeriod}</p>
+            </div>
+          </div>
+
+          {/* Payment Mode */}
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Payment Mode *</Label>
+            <div className="flex gap-3">
+              <Button
+                type="button"
+                variant={paymentMode === "Cash" ? "default" : "outline"}
+                onClick={() => {
+                  setPaymentMode("Cash");
+                  setPaymentType("Cash");
+                }}
+                className="flex-1"
+              >
+                Cash
+              </Button>
+              <Button
+                type="button"
+                variant={paymentMode === "Bank" ? "default" : "outline"}
+                onClick={async () => {
+                  setPaymentMode("Bank");
+                  setPaymentType("Bank Transfer");
+
+                  if (selectedSalaryRow.manageEmployee?.id) {
+                    try {
+                      setIsLoadingBankDetails(true);
+                      const allEmployees = await robustGet("/backend/manage-emp");
+                      const employee = allEmployees.find(
+                        (e: any) => e.id === selectedSalaryRow.manageEmployee?.id
+                      );
+
+                      if (employee && employee.employeeBankDetails?.length > 0) {
+                        const bankDetails = employee.employeeBankDetails[0];
+                        setEmployeeBankDetails(bankDetails);
+
+                        // ✅ Auto-select UPI if available
+                        if (bankDetails.upi) {
+                          setPaymentType("UPI");
+                        }
+                      } else {
+                        setEmployeeBankDetails(null);
+                      }
+                    } catch (err) {
+                      console.error("Error fetching employee bank details:", err);
+                    } finally {
+                      setIsLoadingBankDetails(false);
+                    }
+                  }
+                }}
+                className="flex-1"
+              >
+                Bank
+              </Button>
+            </div>
+          </div>
+
+          {/* Payment Type (for Bank mode) */}
+          {paymentMode === "Bank" && (
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Payment Type *</Label>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {["Cheque", "UPI", "Bank Transfer"].map((type) => (
+                  <Button
+                    key={type}
+                    type="button"
+                    variant={paymentType === type ? "default" : "outline"}
+                    onClick={() => setPaymentType(type)}
+                    className="py-2"
+                  >
+                    {type}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Loading State */}
+          {paymentMode === "Bank" && isLoadingBankDetails && (
+            <div className="p-4 bg-gray-50 rounded-lg border border-gray-200 text-center">
+              <Icon icon="mdi:loading" className="w-5 h-5 animate-spin mx-auto text-blue-600" />
+              <p className="text-sm text-gray-600 mt-2">Loading employee bank details...</p>
+            </div>
+          )}
+
+          {/* No Bank Details Found */}
+          {paymentMode === "Bank" &&
+            !isLoadingBankDetails &&
+            !employeeBankDetails && (
+              <div className="p-4 bg-yellow-50 rounded-lg border border-yellow-200 text-sm text-yellow-800">
+                No bank details found for this employee. Please contact HR to update.
+              </div>
+            )}
+
+          {/* Employee Bank/UPI Details */}
+          {paymentMode === "Bank" && employeeBankDetails && (
+            <>
+              {paymentType === "Bank Transfer" && (
+                <div className="p-4 bg-green-50 rounded-lg border border-green-200">
+                  <h4 className="font-semibold text-green-800 mb-3">
+                    Employee Bank Details
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <Label>Bank Name</Label>
+                      <p className="font-semibold text-green-900">
+                        {employeeBankDetails.bankName || "N/A"}
+                      </p>
+                    </div>
+                    <div>
+                      <Label>Branch Name</Label>
+                      <p className="font-semibold text-green-900">
+                        {employeeBankDetails.bankBranchName || "N/A"}
+                      </p>
+                    </div>
+                    <div>
+                      <Label>Account Number</Label>
+                      <p className="font-semibold text-green-900">
+                        {employeeBankDetails.accNumber || "N/A"}
+                      </p>
+                    </div>
+                    <div>
+                      <Label>IFSC Code</Label>
+                      <p className="font-semibold text-green-900">
+                        {employeeBankDetails.ifscCode || "N/A"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {paymentType === "UPI" && (
+                <div className="p-4 bg-purple-50 rounded-lg border border-purple-200">
+                  <h4 className="font-semibold text-purple-800 mb-3">
+                    Employee UPI Details
+                  </h4>
+                  <Label>UPI ID</Label>
+                  <p className="text-lg font-semibold text-purple-900">
+                    {employeeBankDetails.upi || "N/A"}
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Payment Proof */}
+          {paymentMode === "Bank" && (
+            <div>
+              <Label>
+                {paymentType === "Cheque"
+                  ? "Cheque Number *"
+                  : paymentType === "UPI"
+                  ? "UTR Number *"
+                  : "Transaction Reference *"}
+              </Label>
+              <Input
+                value={paymentProof}
+                onChange={(e) => setPaymentProof(e.target.value)}
+                required={paymentMode === "Bank"}
+                placeholder="Enter reference / cheque / UTR number"
+                className="border-gray-300 focus:border-blue-500"
+              />
+            </div>
+          )}
+
+          {/* Payment Date */}
+          <div>
+            <Label>Payment Date *</Label>
+            <Input
+              type="date"
+              value={paymentDate}
+              onChange={(e) => setPaymentDate(e.target.value)}
+              required
+              className="border-gray-300 focus:border-blue-500"
+            />
+          </div>
+
+          {/* Remark */}
+          <div>
+            <Label>Remark</Label>
+            <Input
+              value={paymentRemark}
+              onChange={(e) => setPaymentRemark(e.target.value)}
+              placeholder="Optional remark"
+              className="border-gray-300 focus:border-blue-500"
+            />
+          </div>
+        </form>
+      )}
+    </div>
+
+    {/* Footer */}
+    <DialogFooter className="px-6 py-4 border-t bg-gray-50 sticky bottom-0">
+      <Button
+        variant="outline"
+        onClick={() => setIsPaymentDialogOpen(false)}
+        className="border-gray-300 hover:bg-gray-50"
+      >
+        Cancel
+      </Button>
+      <Button
+        onClick={handlePaymentSubmit}
+        className="bg-green-600 hover:bg-green-700"
+        disabled={paymentMode === "Bank" && !employeeBankDetails}
+      >
+        <Icon icon="mdi:check-circle" className="w-4 h-4 mr-2" />
+        Mark as Paid
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+
+
+
+      <div className="px-4 pt-5 pb-4 space-y-4">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-1">
+          <h1 className="text-[22px] font-bold text-gray-900">Pay Slips</h1>
+
+          <Dialog open={isDialogOpen} onOpenChange={(o) => { setIsDialogOpen(o); if (!o) resetForm(); }}>
+            {canManage && (
+              <DialogTrigger asChild>
+                <button onClick={resetForm} className="flex items-center gap-1.5 bg-[#2563eb] text-white font-bold text-[13px] rounded-xl px-3 py-2.5 shadow-md shadow-blue-200 active:scale-[0.97] transition-transform">
+                  <Plus className="w-4 h-4" />
+                  Add
+                </button>
+              </DialogTrigger>
+            )}
+
+
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{editing ? "Edit Salary Generation" : "Add New Salary Generation"}</DialogTitle>
+                <DialogDescription>
+                  {editing ? "Update the salary generation information below." : "Fill in the details to add a new salary generation."}
+                </DialogDescription>
+              </DialogHeader>
+
+              <form onSubmit={handleSubmit} className="space-y-6">
+                {/* Organization Selection */}
+                <div className="space-y-4">
+                  <h3 className="text-lg font-semibold">Organization Selection</h3>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    {/* Service Provider */}
+                    
+
+                    {/* Company */}
+                    <div ref={coRef} className="space-y-2 relative">
+                      <Label>Company Name *</Label>
+                      <Input
+                        value={formData.coAutocomplete}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setFormData((p) => ({ ...p, coAutocomplete: val, companyID: null }));
+                          runFetchCO(val);
+                        }}
+                        onFocus={(e) => {
+                          const val = e.target.value;
+                          if (val.length >= MIN_CHARS) runFetchCO(val);
+                        }}
+                        placeholder="Start typing company…"
+                        autoComplete="off"
+                      />
+                      {coList.length > 0 && (
+                        <div className="absolute z-10 bg-white border rounded w-full shadow max-h-48 overflow-y-auto">
+                          {coLoading && <div className="px-3 py-2 text-sm text-gray-500">Loading…</div>}
+                          {coList.map((co) => (
+                            <div
+                              key={co.id}
+                              className="px-3 py-2 hover:bg-gray-100 cursor-pointer"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={async () => {
+                                setFormData((p) => ({
+                                  ...p,
+                                  companyID: co.id,
+                                  coAutocomplete: co.companyName ?? "",
+                                  employeeDbID: null,
+                                  employeeAutocomplete: "",
+                                  monthLabel: "",
+                                }));
+                                setSalaryPeriodOptions([]);
+                                setSelectedCompanyStartDay("");
+                                setCoList([]);
+                                await refreshCompanyDrivenOptions(co.id);
+                              }}
+                            >
+                              {co.companyName}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Branch */}
+                    <div ref={brRef} className="space-y-2 relative">
+                      <Label>Branch Name *</Label>
+                      <Input
+                        value={formData.brAutocomplete}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setFormData((p) => ({ ...p, brAutocomplete: val, branchesID: null }));
+                          runFetchBR(val);
+                        }}
+                        onFocus={(e) => { runFetchBR(formData.brAutocomplete); }}
+                        placeholder="Start typing branch…"
+                        autoComplete="off"
+                      />
+                      {brList.length > 0 && (
+                        <div className="absolute z-10 bg-white border rounded w-full shadow max-h-48 overflow-y-auto">
+                          {brLoading && <div className="px-3 py-2 text-sm text-gray-500">Loading…</div>}
+                          {brList.map((br) => (
+                            <div
+                              key={br.id}
+                              className="px-3 py-2 hover:bg-gray-100 cursor-pointer"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => {
+                                setFormData((p) => ({ ...p, branchesID: br.id, brAutocomplete: br.branchName ?? "" }));
+                                setBrList([]);
+                              }}
+                            >
+                              {br.branchName}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <h3 className="text-lg font-semibold">Employee Selection</h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+                    <div ref={empRef} className="space-y-2 col-span-3 md:col-span-3 relative">
+                      <Label>Select Employee *</Label>
+                      <Input
+                        value={formData.employeeAutocomplete}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setFormData((p) => ({ ...p, employeeAutocomplete: val, employeeDbID: null, monthLabel: "" }));
+                          setSalaryPeriodOptions([]);
+                          setSelectedCompanyStartDay("");
+                          runFetchEmp(val);
+                        }}
+                        onFocus={(e) => {
+                          const val = e.target.value;
+                          if (val.length >= MIN_CHARS) runFetchEmp(val);
+                        }}
+                        placeholder="Type name or employee code…"
+                        autoComplete="off"
+                        required
+                      />
+                      {empList.length > 0 && (
+                        <div className="absolute z-10 bg-white border rounded w-full shadow max-h-56 overflow-y-auto">
+                          {empLoading && <div className="px-3 py-2 text-sm text-gray-500">Loading…</div>}
+                          {empList.map((emp) => {
+                            const name = empName(emp) || "(No name)";
+                            return (
+                              <div
+                                key={emp.id}
+                                className="px-3 py-2 hover:bg-gray-100 cursor-pointer"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => {
+                                  setFormData((p) => ({
+                                    ...p,
+                                    employeeDbID: emp.id,
+                                    employeeAutocomplete: `${name} (${emp.employeeID ?? ""})`,
+                                  }));
+                                  setEmpList([]);
+                                  void loadEmployeeSalaryPeriods(emp.id);
+                                }}
+                              >
+                                {name} <span className="text-gray-500">({emp.employeeID})</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <p className="text-xs text-gray-500">Fetched from /manage-emp</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Salary Period (month) */}
+                <div className="space-y-4">
+                  <h3 className="text-lg font-semibold">Salary Period</h3>
+                  <div className="space-y-2">
+                    <Label htmlFor="month">Select Month *</Label>
+                    <select
+                      id="month"
+                      value={formData.monthLabel}
+                      onChange={(e) => setFormData((p) => ({ ...p, monthLabel: e.target.value }))}
+                      className="w-full h-10 px-3 py-2 border border-[#d0d0d0] bg-white rounded-sm text-sm text-gray-900 shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900/15 focus-visible:border-[#b0b0b0]"
+                      required
+                      disabled={!formData.employeeDbID}
+                    >
+                      <option value="">
+                        {formData.employeeDbID
+                          ? (salaryPeriodOptions.length ? "Select Period" : "No salary cycle on this employee")
+                          : "Select an employee first"}
+                      </option>
+                      {salaryPeriodOptions.map((lbl) => (
+                        <option key={lbl} value={lbl}>{lbl}</option>
+                      ))}
+                    </select>
+
+                    {formData.employeeDbID ? (
+                      <p className="text-xs text-gray-500">
+                        FY start: <b>{selectedCompanyFYStart ?? "-"}</b>; Day: <b>{selectedCompanyStartDay || "-"}</b>
+                      </p>
+                    ) : (
+                      <p className="text-xs text-gray-500">Pick an employee to load that employee&apos;s salary periods.</p>
+                    )}
+                  </div>
+                </div>
+
+
+                <DialogFooter>
+                  <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button type="submit" className="">
+                    {editing ? "Update Salary Generation" : "Add Salary Generation"}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
+        </div>
+
+        {/* Search */}
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
+            <Input
+              placeholder="Search generated salaries…"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="pl-9 bg-white rounded-xl border border-gray-100 shadow-sm text-[13px]"
+            />
+          </div>
+          <span className="text-[12px] font-semibold text-gray-500 bg-white border border-gray-100 rounded-xl px-3 py-2.5 shadow-sm whitespace-nowrap">
+            {filtered.length} records
+          </span>
+        </div>
+
+        {/* Pay Slips — mobile cards */}
+        <div className="space-y-3">
+          {filtered.length === 0 ? (
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-8 flex flex-col items-center gap-3">
+              <Icon icon="solar:bill-bold-duotone" className="w-12 h-12 text-gray-200" />
+              <p className="text-[14px] font-semibold text-gray-400">No records found</p>
+              <p className="text-[12px] text-gray-400 text-center">Try adjusting your search criteria</p>
+            </div>
+          ) : (
+            filtered.map((row) => (
+              <div key={row.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                <div className="flex items-start justify-between gap-2 mb-1.5">
+                  <div className="min-w-0">
+                    <p className="text-[15px] font-bold text-gray-900 truncate">
+                      {row.manageEmployee ? `${empName(row.manageEmployee)} (${row.manageEmployee.employeeID ?? ""})` : "—"}
+                    </p>
+                    <p className="text-[12px] text-gray-400 mt-0.5 truncate">
+                      {row.company?.companyName ?? ""}{row.branches?.branchName ? ` · ${row.branches.branchName}` : ""}
+                    </p>
+                  </div>
+                  <Badge variant={row.status === "Paid" ? "default" : "secondary"} className="shrink-0 text-[10px]">
+                    {row.status || "Pending"}
+                  </Badge>
+                </div>
+                <div className="flex items-center gap-1.5 text-[12px] text-gray-500 mb-2">
+                  <Icon icon="solar:calendar-linear" className="w-3.5 h-3.5 shrink-0" />
+                  <span>{row.monthPeriod}</span>
+                </div>
+                <div className="flex items-center justify-end gap-1 pt-2 border-t border-gray-50">
+                  {canManage && (
+                    <>
+                      <button onClick={() => openPaymentDialog(row)} className="flex items-center gap-1 text-[11px] font-bold text-emerald-600 border border-emerald-100 bg-emerald-50 rounded-lg px-2.5 py-1.5 active:scale-[0.97]">
+                        <Icon icon="mdi:credit-card-outline" className="w-3 h-3" /> Pay
+                      </button>
+                      <button onClick={() => beginEdit(row)} className="flex items-center gap-1 text-[11px] font-bold text-gray-600 border border-gray-100 bg-gray-50 rounded-lg px-2.5 py-1.5 active:scale-[0.97]">
+                        <Edit className="w-3 h-3" /> Edit
+                      </button>
+                      <button onClick={() => handleDelete(row.id)} className="flex items-center gap-1 text-[11px] font-bold text-red-500 border border-red-100 bg-red-50 rounded-lg px-2.5 py-1.5 active:scale-[0.97]">
+                        <Trash2 className="w-3 h-3" /> Delete
+                      </button>
+                    </>
+                  )}
+                  {(row.status === "Approved" || row.status === "Paid") && (
+                  <button
+                    type="button"
+                    onClick={async (e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      try {
+                        await downloadPayslipForSalaryRow(row);
+                        toast.success("Payslip downloaded");
+                      } catch (err) {
+                        console.error("Payslip download failed:", err);
+                        toast.error("Download failed. Check attendance/shift setup and try again.");
+                      }
+                    }}
+                    className="flex items-center gap-1 text-[11px] font-bold text-gray-600 border border-gray-100 bg-gray-50 rounded-lg px-2.5 py-1.5 active:scale-[0.97]"
+                  >
+                    <Download className="w-3 h-3" /> Slip
+                  </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </>
+  );
+}

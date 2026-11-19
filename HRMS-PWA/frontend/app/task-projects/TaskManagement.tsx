@@ -1,0 +1,1312 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import { Label } from "../components/ui/label";
+import { Textarea } from "../components/ui/textarea";
+import { FormDrawer } from "../components/ui/form-drawer";
+import { DetailCard } from "../components/app/detail-card";
+import { EntityDetailHero, EntityDetailLayout } from "../components/app/entity-detail-layout";
+import { MessageCircle, Plus, AlertTriangle, UserPlus, FileDown, ClipboardList, ChevronLeft, ChevronRight } from "lucide-react";
+import { useCurrentUser } from "../hooks/useCurrentUser";
+import { isDesktopManagerFlagSet } from "@/lib/desktopManager";
+import { hasModuleWriteAccess, canViewModule, isCompanyAdminLikeRole } from "@/lib/companyAccess";
+import { canViewProductModule, useProductAccess } from "@/lib/productAccess";
+import { selectableTaskTypes, taskTypeNeedsSite } from "../utils/taskSitePunch";
+import { toast } from "sonner";
+import { taskFetch } from "../utils/taskApi";
+import { toDatetimeLocalValue, toIsoFromDatetimeLocal } from "../utils/taskDueAt";
+import { NEXT_TASK_STATUS } from "../utils/taskStatusFlow";
+import { SearchSuggestInput } from "../components/SearchSuggestInput";
+import { TaskDetailTabs } from "../components/task/TaskDetailTabs";
+import { TaskRemarksChatbox } from "../components/task/TaskRemarksChatbox";
+import {
+  TASK_STATUSES,
+  TaskBoardSkeleton,
+  TaskStatusBadge,
+  formatTaskDate,
+  type TaskStatus,
+} from "../components/task/task-ui";
+import { downloadTaskReportForId } from "../utils/taskReportPdf";
+import { dispatchAppRefresh } from "../utils/appRefresh";
+import { useAppRefresh } from "../hooks/useAppRefresh";
+import { useTaskChatPolling } from "../hooks/useTaskChatPolling";
+import { getSidebarContext } from "../utils/sidebarContext";
+import { PageHeader } from "../components/app/page-header";
+import { FilterBar, FilterSelect } from "../components/app/filter-bar";
+import { EntityListShell } from "../components/app/entity-list-shell";
+import type { DataTableColumn } from "../components/app/data-table";
+import { EntityRowActions } from "../components/app/entity-row-actions";
+import { TaskContactsRepeater, sanitizeContacts, type TaskContactRow } from "../components/task/TaskContactsRepeater";
+import { EnplSyncButton } from "../components/task/EnplSyncButton";
+import { canonicalTaskStatus } from "../components/task/task-types";
+import { useClientTable, sortRows } from "../hooks/use-client-table";
+import {
+  formatSitePunchAt,
+  isSitePunchTaskType,
+  lastSitePunchByKind,
+  sitePunchesFromTask,
+} from "../utils/taskSitePunch";
+
+const STATUSES = TASK_STATUSES;
+const PRIORITIES = ["Urgent", "High", "Medium", "Low"];
+
+interface Task {
+  id: number; taskCode: string; taskName: string; taskType: string;
+  status: string; priority: string;
+  scheduleDateTime?: string | null; dueDateTime?: string | null; dueAt?: string | null;
+  description?: string | null;
+  departmentID?: number | null; customerID?: number | null; siteID?: number | null;
+  createdAt?: string; updatedAt?: string;
+  department?: { id: number; departmentName?: string | null };
+  customer?: { id: number; customerCode: string; customerName: string };
+  site?: { id: number; branchName: string };
+  assignments?: { manageEmployeeID: number; manageEmployee?: { employeeFirstName?: string; employeeLastName?: string } }[];
+  contacts?: { contactName?: string; contactPerson?: string; contactNumber: string; contactEmail?: string; email?: string; designation?: string }[];
+  workscopeDetails?: { workscopeDetails?: string | null; extraNote?: string | null }[];
+  images?: { fileUrl?: string | null; filename?: string }[];
+  notes?: { title?: string | null; note?: string | null; fileUrl?: string | null }[];
+  inventories?: { makeModel?: string | null; snMac?: string | null; description?: string | null }[];
+  purchase?: { purchaseType?: string | null; customerName?: string | null; address?: string | null };
+  engineerAssignments?: { engineerName?: string | null; engineerEmail?: string | null; status?: string | null }[];
+  chats?: { id: number; message: string; senderName?: string; attachmentUrl?: string | null; createdAt: string }[];
+  sitePunches?: { kind?: string; at?: string; createdAt?: string; senderName?: string; employeeName?: string; message?: string }[];
+  activities?: { id: number; action: string; oldValue?: string; newValue?: string; remark?: string; actorName?: string; createdAt: string }[];
+}
+
+interface Dept {
+  id: number;
+  departmentName?: string | null;
+  companyID?: number | null;
+  serviceProviderID?: number | null;
+}
+
+interface Employee {
+  id: number;
+  employeeFirstName?: string;
+  employeeLastName?: string;
+  employeeID?: string;
+  companyName?: string | null;
+}
+
+function engineerNames(task: Task) {
+  const names = (task.assignments || [])
+    .map((a) => [a.manageEmployee?.employeeFirstName, a.manageEmployee?.employeeLastName].filter(Boolean).join(" "))
+    .filter(Boolean);
+  return names.length ? names.join(", ") : "N/A";
+}
+
+function getLastActivityTime(task: Task): number {
+  // Use the most recent chat timestamp, falling back to updatedAt, then createdAt
+  const lastChat = task.chats?.[0]?.createdAt;
+  if (lastChat) return new Date(lastChat).getTime();
+  if (task.updatedAt) return new Date(task.updatedAt).getTime();
+  if (task.createdAt) return new Date(task.createdAt).getTime();
+  return 0;
+}
+
+function isOverdue24h(task: Task) {
+  if (task.status === "Closed" || task.status === "Completed" || task.status === "Reopen") return false;
+  const last = getLastActivityTime(task);
+  if (!last) return false;
+  return (Date.now() - last) / (1000 * 60 * 60) > 24;
+}
+
+export default function TaskManagement() {
+  const user = useCurrentUser();
+  const productAccess = useProductAccess();
+  const siteVisitEnabled = canViewProductModule("ONFIELD_TASK_MODULE");
+  const desktopManager =
+    user?.role === "EMPLOYEE" && isDesktopManagerFlagSet();
+  const canManage =
+    user?.role === "SUPERADMIN" ||
+    isCompanyAdminLikeRole(user?.role) ||
+    desktopManager ||
+    hasModuleWriteAccess("TASKS");
+  const canView =
+    canManage ||
+    user?.role === "SUPERADMIN" ||
+    isCompanyAdminLikeRole(user?.role) ||
+    canViewModule("TASKS");
+  const table = useClientTable("taskCode");
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [priorityFilter, setPriorityFilter] = useState("ALL");
+  const [taskTypeFilter, setTaskTypeFilter] = useState("ALL");
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
+  const customerIdRef = useRef("");
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detail, setDetail] = useState<Task | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatTask, setChatTask] = useState<Task | null>(null);
+  const [chatMsg, setChatMsg] = useState("");
+  const [chatStatus, setChatStatus] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  const [detailChatMsg, setDetailChatMsg] = useState("");
+  const [detailChatSending, setDetailChatSending] = useState(false);
+  // Assign employees modal
+  const [assignTask, setAssignTask] = useState<Task | null>(null);
+  const [assignEmployees, setAssignEmployees] = useState<Employee[]>([]);
+  const [assignIds, setAssignIds] = useState<number[]>([]);
+  const [assignDue, setAssignDue] = useState("");
+  const [assignSaving, setAssignSaving] = useState(false);
+  const [form, setForm] = useState({
+    departmentID: "", taskType: "Internal Task", customerID: "", siteID: "",
+    taskName: "", description: "", scheduleDateTime: "", priority: "Medium",
+    dueDateTime: "",
+  });
+  const [customerLabel, setCustomerLabel] = useState("");
+  const [branchLabel, setBranchLabel] = useState("");
+  const [assignDeptId, setAssignDeptId] = useState("");
+  const [assignDeptLabel, setAssignDeptLabel] = useState("");
+  const [assignDesigId, setAssignDesigId] = useState("");
+  const [assignDesigLabel, setAssignDesigLabel] = useState("");
+  const [formEmployees, setFormEmployees] = useState<Employee[]>([]);
+  const [formAssignIds, setFormAssignIds] = useState<number[]>([]);
+  const [taskContacts, setTaskContacts] = useState<TaskContactRow[]>([]);
+
+  useEffect(() => {
+    customerIdRef.current = form.customerID;
+  }, [form.customerID]);
+
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(table.search), 300);
+    return () => clearTimeout(t);
+  }, [table.search]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, statusFilter, priorityFilter, taskTypeFilter]);
+
+  const searchCustomers = useCallback(async (q: string) => {
+    const data = await taskFetch<any[]>("/task-customers/dropdown", user, undefined, { q, limit: 20 });
+    return data.map((c) => ({ ...c, label: `${c.customerCode} — ${c.customerName}` }));
+  }, [user]);
+
+  const searchBranches = useCallback(async (q: string) => {
+    const params: Record<string, string | number> = { q, limit: 20 };
+    if (customerIdRef.current) params.customerID = customerIdRef.current;
+    const data = await taskFetch<any[]>("/task-customer-sites/dropdown", user, undefined, params);
+    return data.map((s) => ({
+      ...s,
+      label: s.customer?.customerName
+        ? `${s.branchName} — ${s.customer.customerName}`
+        : s.branchName,
+    }));
+  }, [user]);
+
+const searchDepartments = useCallback(async (q: string) => {
+  try {
+    const depts = await fetch("/backend/departments", { cache: "no-store" }).then((r) => r.json());
+    let list: Dept[] = Array.isArray(depts) ? depts : [];
+
+    const ctx = getSidebarContext();
+
+    const activeCompanyID =
+      ctx?.companyID ??
+      user?.companyID ??
+      null;
+
+    if (activeCompanyID) {
+      list = list.filter(
+        (d: any) => Number(d.companyID) === Number(activeCompanyID)
+      );
+    }
+
+    const term = q.trim().toLowerCase();
+
+    return list
+      .filter((d) => !term || (d.departmentName || "").toLowerCase().includes(term))
+      .slice(0, 20)
+      .map((d) => ({
+        ...d,
+        label: d.departmentName || `Dept #${d.id}`,
+      }));
+  } catch {
+    return [];
+  }
+}, [user?.companyID]);
+
+  const searchDesignations = useCallback(async (q: string) => {
+    try {
+      const rows = await fetch("/backend/designations", { cache: "no-store" }).then((r) => r.json());
+      let list: Array<{ id: number; designation?: string | null; companyID?: number | null; departmentID?: number | null }> =
+        Array.isArray(rows) ? rows : [];
+      const ctx = getSidebarContext();
+      const activeCompanyID = ctx?.companyID ?? user?.companyID ?? null;
+      if (activeCompanyID) {
+        list = list.filter((d) => Number(d.companyID) === Number(activeCompanyID));
+      }
+      if (assignDeptId) {
+        list = list.filter((d) => !d.departmentID || Number(d.departmentID) === Number(assignDeptId));
+      }
+      const term = q.trim().toLowerCase();
+      return list
+        .filter((d) => !term || (d.designation || "").toLowerCase().includes(term))
+        .slice(0, 20)
+        .map((d) => ({ ...d, label: d.designation || `Designation #${d.id}` }));
+    } catch {
+      return [];
+    }
+  }, [user?.companyID, assignDeptId]);
+
+  const loadTasks = useCallback(async () => {
+    if (!user) return;
+    setLoading(true);
+    try {
+      const params: Record<string, string | number> = { page, limit: 10, search: debouncedSearch };
+      if (statusFilter !== "ALL") params.status = statusFilter;
+      if (priorityFilter !== "ALL") params.priority = priorityFilter;
+      if (taskTypeFilter !== "ALL") params.taskType = taskTypeFilter;
+      const data = await taskFetch<{ items: Task[]; total: number; totalPages: number; statusCounts?: Record<string, number> }>("/task-projects", user, undefined, params);
+      setTasks(data.items);
+      setTotal(data.total || 0);
+      setTotalPages(data.totalPages || 1);
+      setStatusCounts(data.statusCounts || {});
+    } catch (e: any) { toast.error(e.message || "Failed to load tasks"); }
+    finally { setLoading(false); }
+  }, [user, page, debouncedSearch, statusFilter, priorityFilter, taskTypeFilter]);
+
+useEffect(() => {
+  const load = () => {
+    if (user) loadTasks();
+  };
+
+  load();
+
+  const sidebarPageClickHandler = (e: any) => {
+    if (e.detail?.path === "/task-projects") {
+      closeTaskPagePanels();
+      load();
+    }
+  };
+
+const sidebarCompanyChangeHandler = () => {
+  setForm((p) => ({
+    ...p,
+    departmentID: "",
+    siteID: "",
+    customerID: "",
+  }));
+
+  customerIdRef.current = "";
+  setCustomerLabel("");
+  setBranchLabel("");
+  setAssignDeptId("");
+  setAssignDeptLabel("");
+  setAssignDesigId("");
+  setAssignDesigLabel("");
+  setFormEmployees([]);
+  setFormAssignIds([]);
+
+  load();
+};
+
+window.addEventListener("sidebar-main-page-click", sidebarPageClickHandler);
+window.addEventListener("sidebar-context-changed", sidebarCompanyChangeHandler);
+window.addEventListener("app-data-refresh", sidebarCompanyChangeHandler);
+
+return () => {
+  window.removeEventListener("sidebar-main-page-click", sidebarPageClickHandler);
+  window.removeEventListener("sidebar-context-changed", sidebarCompanyChangeHandler);
+  window.removeEventListener("app-data-refresh", sidebarCompanyChangeHandler);
+};
+}, [user, loadTasks]);
+
+useAppRefresh(() => {
+  if (user) loadTasks();
+}, [user, loadTasks]);
+
+
+  const downloadReport = async (t: Task) => {
+    try {
+      const tid = toast.loading("Generating report…");
+      await downloadTaskReportForId(t.id, user, t.taskCode);
+      toast.dismiss(tid);
+      toast.success("Report downloaded");
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "Failed to download report");
+    }
+  };
+
+  // Load employees for assign modal: same-company and mutually linked companies, department only
+  useEffect(() => {
+    if (!assignTask) { setAssignEmployees([]); return; }
+    const departmentId = assignTask.departmentID || 0;
+    taskFetch<Employee[]>(`/task-projects/employees-by-department/${departmentId}`, user)
+      .then(setAssignEmployees).catch(() => setAssignEmployees([]));
+  }, [assignTask, user]);
+
+  useEffect(() => {
+    if (!formOpen || (!assignDeptId && !assignDesigId)) {
+      setFormEmployees([]);
+      return;
+    }
+    const departmentId = assignDeptId || "0";
+    taskFetch<Employee[]>(
+      `/task-projects/employees-by-department/${departmentId}`,
+      user,
+      undefined,
+      assignDesigId ? { designationID: assignDesigId } : undefined,
+    )
+      .then(setFormEmployees)
+      .catch(() => setFormEmployees([]));
+  }, [formOpen, assignDeptId, assignDesigId, user]);
+
+  const stats = useMemo(() => {
+    const g = { Open: 0, WIP: 0, Closed: 0, Reopen: 0, Scheduled: 0, Rescheduled: 0, OnHold: 0 };
+    Object.entries(statusCounts).forEach(([status, n]) => {
+      const s = canonicalTaskStatus(status);
+      const count = Number(n) || 0;
+      if (s === "Open") g.Open += count;
+      else if (s === "Work in Progress") g.WIP += count;
+      else if (s === "Completed") g.Closed += count;
+      else if (s === "Reopen") g.Reopen += count;
+      else if (s === "Scheduled") g.Scheduled += count;
+      else if (s === "Rescheduled") g.Rescheduled += count;
+      else if (s === "On-Hold") g.OnHold += count;
+    });
+    return { total, ...g };
+  }, [statusCounts, total]);
+
+  const resetForm = () => {
+    setForm({ departmentID: "", taskType: "Internal Task", customerID: "", siteID: "", taskName: "", description: "", scheduleDateTime: "", priority: "Medium", dueDateTime: "" });
+    customerIdRef.current = "";
+    setCustomerLabel(""); setBranchLabel(""); setEditingTask(null);
+    setAssignDeptId(""); setAssignDeptLabel(""); setAssignDesigId(""); setAssignDesigLabel("");
+    setFormEmployees([]); setFormAssignIds([]);
+    setTaskContacts([]);
+  };
+
+ const closeTaskPagePanels = () => {
+  resetForm();
+
+  setFormOpen(false);
+  setEditingTask(null);
+
+  setDetailOpen(false);
+  setDetail(null);
+
+  setChatOpen(false);
+  setChatTask(null);
+  setChatMsg("");
+
+};
+
+  const openAssign = async (t: Task) => {
+    const full = await taskFetch<Task>(`/task-projects/${t.id}`, user).catch(() => t);
+    setAssignTask(full);
+    setAssignIds((full.assignments || []).map((a) => a.manageEmployeeID));
+    setAssignDue(toDatetimeLocalValue(full.dueDateTime || full.dueAt));
+  };
+
+  const saveAssign = async () => {
+    if (!assignTask) return;
+    if (assignIds.length > 0 && !assignDue) {
+      toast.error("Due date & time is required when an engineer is assigned");
+      return;
+    }
+    setAssignSaving(true);
+    try {
+      const dueIso = toIsoFromDatetimeLocal(assignDue);
+      await taskFetch(`/task-projects/${assignTask.id}/assign`, user, {
+        method: "PATCH",
+        body: JSON.stringify({
+          assignedEmployeeIds: assignIds,
+          dueAt: dueIso,
+          dueDateTime: dueIso,
+        }),
+      });
+      toast.success("Employees assigned");
+      setAssignTask(null);
+      loadTasks();
+      dispatchAppRefresh();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setAssignSaving(false); }
+  };
+
+  const openDetail = async (t: Task) => {
+    try {
+      const full = await taskFetch<Task>(`/task-projects/${t.id}`, user);
+      setDetail(full);
+      setDetailChatMsg("");
+      setDetailOpen(true);
+    } catch (e: any) { toast.error(e.message); }
+  };
+
+  const openEdit = async (t: Task) => {
+    try {
+      const full = await taskFetch<Task>(`/task-projects/${t.id}`, user);
+      setEditingTask(full);
+      setForm({
+        departmentID: full.departmentID ? String(full.departmentID) : "",
+        taskType: full.taskType, customerID: full.customerID ? String(full.customerID) : "",
+        siteID: full.siteID ? String(full.siteID) : "", taskName: full.taskName,
+        description: full.description || "",
+        scheduleDateTime: toDatetimeLocalValue(full.scheduleDateTime),
+        priority: full.priority,
+        dueDateTime: toDatetimeLocalValue(full.dueDateTime || full.dueAt),
+      });
+      setCustomerLabel(full.customer ? `${full.customer.customerCode} — ${full.customer.customerName}` : "");
+      customerIdRef.current = full.customerID ? String(full.customerID) : "";
+      setBranchLabel(full.site?.branchName || "");
+      setFormAssignIds((full.assignments || []).map((a) => a.manageEmployeeID));
+      setTaskContacts(
+        (full.contacts || []).map((c) => ({
+          contactPerson: c.contactName || c.contactPerson || "",
+          contactNumber: c.contactNumber || "",
+          designation: c.designation || "",
+          email: c.contactEmail || c.email || "",
+        })),
+      );
+      setFormOpen(true);
+    } catch (e: any) { toast.error(e.message); }
+  };
+
+  const openChat = async (t: Task) => {
+    try {
+      const full = await taskFetch<Task>(`/task-projects/${t.id}`, user);
+      setChatTask(full); setChatStatus(full.status); setChatMsg(""); setChatOpen(true);
+    } catch (e: any) { toast.error(e.message); }
+  };
+
+  const submitTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.taskName.trim()) { toast.error("Title is required"); return; }
+    const engineersAssigned = formAssignIds.length > 0 || !!(
+      editingTask?.engineerAssignments?.length || editingTask?.assignments?.length
+    );
+    if (engineersAssigned && !form.dueDateTime) {
+      toast.error("Due date & time is required when an engineer is assigned");
+      return;
+    }
+    setSaving(true);
+    const isCustomerVisit = taskTypeNeedsSite(form.taskType);
+    const dueIso = toIsoFromDatetimeLocal(form.dueDateTime);
+    const payload = {
+      taskType: form.taskType,
+      customerID: isCustomerVisit && form.customerID ? Number(form.customerID) : undefined,
+      siteID: isCustomerVisit && form.siteID ? Number(form.siteID) : undefined,
+      taskName: form.taskName, description: form.description,
+      scheduleDateTime: form.scheduleDateTime || undefined, priority: form.priority,
+      dueDateTime: dueIso,
+      dueAt: dueIso,
+      assignedEmployeeIds: formAssignIds,
+      contacts: isCustomerVisit
+        ? sanitizeContacts(taskContacts).map((c) => ({
+            contactName: c.contactPerson,
+            contactNumber: c.contactNumber,
+            contactEmail: c.email,
+            designation: c.designation,
+          }))
+        : [],
+    };
+    try {
+      if (editingTask) {
+        await taskFetch(`/task-projects/${editingTask.id}`, user, { method: "PATCH", body: JSON.stringify(payload) });
+        toast.success("Task updated");
+      } else {
+        await taskFetch("/task-projects", user, { method: "POST", body: JSON.stringify(payload) });
+        toast.success("Task created");
+      }
+      setFormOpen(false); resetForm(); loadTasks();
+      dispatchAppRefresh();
+    } catch (err: any) { toast.error(err.message); }
+    finally { setSaving(false); }
+  };
+
+  const removeTask = async (id: number) => {
+    try {
+      await taskFetch(`/task-projects/${id}`, user, { method: "DELETE" });
+      toast.success("Task deleted");
+      if (chatTask?.id === id) { setChatOpen(false); setChatTask(null); }
+      loadTasks();
+      dispatchAppRefresh();
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const applyChatStatus = async (next: string) => {
+    if (!chatTask) return;
+    setChatStatus(next);
+    if (next === chatTask.status) return;
+    try {
+      await taskFetch(`/task-projects/${chatTask.id}/status`, user, {
+        method: "PATCH",
+        body: JSON.stringify({ status: next, actorName: user?.username }),
+      });
+      const full = await taskFetch<Task>(`/task-projects/${chatTask.id}`, user);
+      setChatTask(full);
+      setChatStatus(full.status);
+      loadTasks();
+      dispatchAppRefresh();
+      toast.success(`Status updated to ${next === "WIP" ? "Work In Progress" : next}`);
+    } catch (err: any) {
+      setChatStatus(chatTask.status);
+      toast.error(err.message || "Could not update status");
+    }
+  };
+
+  const sendChat = async (payload: { message: string; attachmentUrl?: string }) => {
+    if (!chatTask) return;
+    if (!payload.message.trim() && !payload.attachmentUrl) return;
+    setChatSending(true);
+    try {
+      const newStatus = chatStatus && chatStatus !== chatTask.status ? chatStatus : undefined;
+      await taskFetch(`/task-projects/${chatTask.id}/chats`, user, {
+        method: "POST",
+        body: JSON.stringify({
+          message: payload.message,
+          attachmentUrl: payload.attachmentUrl,
+          senderName: user?.username,
+          status: newStatus,
+          remark: payload.message || "Image attachment",
+        }),
+      });
+      setChatMsg("");
+      const full = await taskFetch<Task>(`/task-projects/${chatTask.id}`, user);
+      setChatTask(full); setChatStatus(full.status); loadTasks();
+    } catch (err: any) { toast.error(err.message); }
+    finally { setChatSending(false); }
+  };
+
+  const sendDetailChat = async () => {
+    if (!detail || !detailChatMsg.trim()) return;
+    setDetailChatSending(true);
+    try {
+      await taskFetch(`/task-projects/${detail.id}/chats`, user, {
+        method: "POST",
+        body: JSON.stringify({
+          message: detailChatMsg,
+          senderName: user?.username,
+          remark: detailChatMsg,
+        }),
+      });
+      setDetailChatMsg("");
+      const full = await taskFetch<Task>(`/task-projects/${detail.id}`, user);
+      setDetail(full);
+      loadTasks();
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setDetailChatSending(false);
+    }
+  };
+
+  useTaskChatPolling<Task>(
+    detail?.id,
+    user,
+    (full) => {
+      if (detailOpen) setDetail(full);
+    },
+    detailOpen && !!detail,
+  );
+
+  useTaskChatPolling<Task>(
+    chatTask?.id,
+    user,
+    (full) => {
+      setChatTask((prev) => {
+        if (!prev || prev.id !== full.id) {
+          setChatStatus(full.status);
+          return full;
+        }
+        setChatStatus((sel) => {
+          const pendingLocalStatus = sel !== prev.status;
+          if (pendingLocalStatus && full.status === prev.status) return sel;
+          return full.status;
+        });
+        return full;
+      });
+    },
+    chatOpen && !!chatTask,
+  );
+
+  const sortedTasks = useMemo(
+    () =>
+      sortRows(tasks, table.sortBy, table.sortDir, (row, key) => {
+        const t = row as Task;
+        if (key === "taskCode") return t.taskCode ?? "";
+        if (key === "department") return t.department?.departmentName ?? "";
+        if (key === "customer") return t.customer?.customerName ?? "";
+        if (key === "site") return t.site?.branchName ?? "";
+        if (key === "engineer") return engineerNames(t);
+        if (key === "status") return t.status ?? "";
+        if (key === "createdAt") return t.createdAt ?? "";
+        if (key === "updatedAt") return t.updatedAt ?? "";
+        return "";
+      }),
+    [tasks, table.sortBy, table.sortDir],
+  );
+
+  const statusFilterOptions = useMemo(
+    () => [
+      { value: "ALL", label: "All" },
+      { value: "Open", label: "Open" },
+      { value: "Work in Progress", label: "In Progress" },
+      { value: "Completed", label: "Closed" },
+    ],
+    [],
+  );
+
+  const priorityFilterOptions = useMemo(
+    () => [
+      { value: "ALL", label: "All priorities" },
+      ...PRIORITIES.map((p) => ({ value: p, label: p })),
+    ],
+    [],
+  );
+
+  const taskTypeFilterOptions = useMemo(
+    () => [
+      { value: "ALL", label: "All types" },
+      ...selectableTaskTypes(undefined, siteVisitEnabled).map((t) => ({ value: t, label: t })),
+    ],
+    [siteVisitEnabled, productAccess],
+  );
+
+  const taskColumns = useMemo((): DataTableColumn<Task>[] => [
+    {
+      key: "taskCode",
+      header: "Task ID",
+      sortable: true,
+      colSpan: 2,
+      cell: (t) => {
+        const overdue = isOverdue24h(t);
+        const overdueHours = overdue ? Math.floor((Date.now() - getLastActivityTime(t)) / (1000 * 60 * 60)) : 0;
+        return (
+          <div className="font-mono text-xs whitespace-nowrap">
+            <div className="flex items-center gap-1.5">
+              {overdue && <AlertTriangle className="w-3.5 h-3.5 text-red-500 shrink-0" />}
+              <span className={overdue ? "text-red-700 font-semibold" : ""}>{t.taskCode}</span>
+            </div>
+            {overdue && (
+              <span className="text-[10px] text-red-500 font-medium">
+                {t.status} &gt; {overdueHours}h
+              </span>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: "department",
+      header: "Department",
+      sortable: true,
+      colSpan: 2,
+      cell: (t) => <span className="text-sm">{t.department?.departmentName || "—"}</span>,
+    },
+    {
+      key: "customer",
+      header: "Customer",
+      sortable: true,
+      colSpan: 2,
+      cell: (t) => (
+        <span className="text-sm line-clamp-2">{t.customer?.customerName || "—"}</span>
+      ),
+    },
+    {
+      key: "site",
+      header: "Site",
+      sortable: true,
+      colSpan: 1,
+      cell: (t) => <span className="text-sm">{t.site?.branchName || "—"}</span>,
+    },
+    {
+      key: "engineer",
+      header: "Engineer",
+      sortable: true,
+      colSpan: 2,
+      cell: (t) => <span className="text-sm">{engineerNames(t)}</span>,
+    },
+    {
+      key: "status",
+      header: "Status",
+      sortable: true,
+      colSpan: 1,
+      cell: (t) => <TaskStatusBadge status={t.status} size="xs" />,
+    },
+    {
+      key: "createdAt",
+      header: "Created At",
+      sortable: true,
+      colSpan: 1,
+      cell: (t) => (
+        <span className="text-xs text-gray-500 whitespace-nowrap">{formatTaskDate(t.createdAt)}</span>
+      ),
+    },
+    {
+      key: "updatedAt",
+      header: "Updated At",
+      sortable: true,
+      colSpan: 1,
+      cell: (t) => (
+        <span className="text-xs text-gray-500 whitespace-nowrap">{formatTaskDate(t.updatedAt)}</span>
+      ),
+    },
+    {
+      key: "siteCheckIn",
+      header: "Site check in",
+      colSpan: 1,
+      cell: (t) => {
+        if (!isSitePunchTaskType(t.taskType)) return <span className="text-xs text-gray-400">—</span>;
+        const punches = sitePunchesFromTask(t);
+        const lastIn = lastSitePunchByKind(punches, "in");
+        const inCount = punches.filter((p) => p.kind === "in").length;
+        return (
+          <span className="text-xs text-gray-700 whitespace-nowrap">
+            {lastIn ? formatSitePunchAt(lastIn.at) : "—"}
+            {inCount > 1 ? <span className="text-gray-400"> ({inCount})</span> : null}
+          </span>
+        );
+      },
+    },
+    {
+      key: "siteCheckOut",
+      header: "Site check out",
+      colSpan: 1,
+      cell: (t) => {
+        if (!isSitePunchTaskType(t.taskType)) return <span className="text-xs text-gray-400">—</span>;
+        const punches = sitePunchesFromTask(t);
+        const lastOut = lastSitePunchByKind(punches, "out");
+        const outCount = punches.filter((p) => p.kind === "out").length;
+        return (
+          <span className="text-xs text-gray-700 whitespace-nowrap">
+            {lastOut ? formatSitePunchAt(lastOut.at) : "—"}
+            {outCount > 1 ? <span className="text-gray-400"> ({outCount})</span> : null}
+          </span>
+        );
+      },
+    },
+    {
+      key: "actions",
+      header: "Actions",
+      colSpan: 2,
+      align: "right",
+      cell: (t) => (
+        <EntityRowActions
+          onView={() => openDetail(t)}
+          onEdit={canManage ? () => openEdit(t) : undefined}
+          onDelete={canManage ? () => removeTask(t.id) : undefined}
+          extra={[
+            ...(canManage
+              ? [
+                  {
+                    icon: UserPlus,
+                    title: "Assign Employees",
+                    onClick: () => openAssign(t),
+                    className: "text-violet-600",
+                  },
+                ]
+              : []),
+            {
+              icon: MessageCircle,
+              title: "Remarks",
+              onClick: () => openChat(t),
+              className: "text-emerald-600",
+            },
+            {
+              icon: FileDown,
+              title: "Download report",
+              onClick: () => downloadReport(t),
+              className: "text-slate-600",
+            },
+          ]}
+        />
+      ),
+    },
+  ], [canManage]);
+
+  if (!user) return <div className="p-6"><TaskBoardSkeleton /></div>;
+  if (!canView) return <div className="p-6 text-gray-500">Access denied. You need Tasks module rights to manage tasks here.</div>;
+
+  return (
+    <div className="space-y-6 w-full max-w-none animate-fade-in page-content-enter">
+      {!formOpen && !detailOpen && (
+        <>
+          <PageHeader
+            icon={ClipboardList}
+            title="Tasks / Projects"
+            description="Manage tasks and project assignments"
+            actions={
+              canManage ? (
+              <div className="flex items-center gap-2">
+                <EnplSyncButton user={user} onDone={loadTasks} />
+                <Button
+                  onClick={() => {
+                    closeTaskPagePanels();
+                    setFormOpen(true);
+                  }}
+                >
+                  <Plus className="w-4 h-4 mr-1" /> Create Task
+                </Button>
+              </div>
+              ) : undefined
+            }
+          />
+
+          <FilterBar
+            search={{
+              value: table.search,
+              onChange: table.setSearch,
+              placeholder: "Search tasks…",
+            }}
+            filters={
+              <>
+                <FilterSelect
+                  id="tasks-status"
+                  value={statusFilter}
+                  onChange={setStatusFilter}
+                  options={statusFilterOptions}
+                  width="w-44"
+                  ariaLabel="Filter by status"
+                />
+                <FilterSelect
+                  id="tasks-priority"
+                  value={priorityFilter}
+                  onChange={setPriorityFilter}
+                  options={priorityFilterOptions}
+                  width="w-40"
+                  ariaLabel="Filter by priority"
+                />
+                <FilterSelect
+                  id="tasks-type"
+                  value={taskTypeFilter}
+                  onChange={setTaskTypeFilter}
+                  options={taskTypeFilterOptions}
+                  width="w-44"
+                  ariaLabel="Filter by task type"
+                />
+              </>
+            }
+          />
+
+          <div className="flex flex-wrap items-center gap-2">
+            {[
+              { label: "All", status: "ALL", value: Object.values(statusCounts).reduce((sum, n) => sum + (Number(n) || 0), 0), cls: "bg-slate-50 text-slate-700 border-slate-200" },
+              { label: "Open", status: "Open", value: stats.Open, cls: "bg-slate-50 text-slate-700 border-slate-200" },
+              { label: "In Progress", status: "Work in Progress", value: stats.WIP, cls: "bg-amber-50 text-amber-800 border-amber-200" },
+              { label: "Closed", status: "Completed", value: stats.Closed, cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+            ].map((s) => (
+              <button
+                key={s.status}
+                type="button"
+                onClick={() => setStatusFilter(statusFilter === s.status ? "ALL" : s.status)}
+                className={`text-xs font-medium px-3 py-1.5 rounded-full border transition-colors whitespace-nowrap ${s.cls} ${statusFilter === s.status ? "ring-2 ring-offset-1 ring-blue-400" : ""}`}
+              >
+                {s.label} <span className="font-bold">{s.value}</span>
+              </button>
+            ))}
+          </div>
+
+          <EntityListShell
+            title="All tasks"
+            totalLabel={() => `${total} tasks`}
+            columns={taskColumns}
+            rows={sortedTasks}
+            rowKey={(t) => String(t.id)}
+            isLoading={loading}
+            sortBy={table.sortBy}
+            sortDir={table.sortDir}
+            onSort={table.setSort}
+            emptyIcon={ClipboardList}
+            emptyTitle="No tasks found"
+            emptyDescription="Create a task to start tracking work."
+            emptyAction={
+              <Button
+                onClick={() => {
+                  closeTaskPagePanels();
+                  setFormOpen(true);
+                }}
+              >
+                <Plus className="w-4 h-4 mr-1" /> Create Task
+              </Button>
+            }
+            footer={
+              <div className="flex flex-col gap-3 border-t border-border px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+                <span className="text-[13px] text-muted-foreground">
+                  Page {page} of {totalPages}
+                </span>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => p - 1)}
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page >= totalPages}
+                    onClick={() => setPage((p) => p + 1)}
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </Button>
+                </div>
+              </div>
+            }
+          />
+        </>
+      )}
+
+      <FormDrawer open={formOpen} onOpenChange={(v) => { if (!v) { setFormOpen(false); resetForm(); } }} title={editingTask ? "Edit Task" : "Create Task"} showHeaderCancel>
+        <form onSubmit={submitTask} className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-2 sm:col-span-2">
+              <Label>Task Type</Label>
+              <select
+                className="app-select w-full"
+                value={form.taskType}
+                onChange={(e) => {
+                  const nextType = e.target.value;
+                  const needsSite = taskTypeNeedsSite(nextType);
+                  setForm((p) => ({
+                    ...p,
+                    taskType: nextType,
+                    ...(needsSite ? {} : { customerID: "", siteID: "" }),
+                  }));
+                  if (!needsSite) {
+                    customerIdRef.current = "";
+                    setCustomerLabel("");
+                    setBranchLabel("");
+                    setTaskContacts([]);
+                  }
+                }}
+              >
+                {selectableTaskTypes(form.taskType, siteVisitEnabled).map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+          </div>
+          {taskTypeNeedsSite(form.taskType) ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <SearchSuggestInput label="Customer" placeholder="Search customer…" value={customerLabel} onChange={setCustomerLabel}
+              fetchData={searchCustomers} displayField="label" valueField="id"
+              onSelect={({ value }) => {
+                customerIdRef.current = String(value);
+                setForm((p) => ({ ...p, customerID: String(value), siteID: "" }));
+                setBranchLabel("");
+              }} />
+            <SearchSuggestInput
+              key={form.customerID || "all-branches"}
+              label="Site"
+              placeholder="Search site…"
+              value={branchLabel}
+              onChange={setBranchLabel}
+              fetchData={searchBranches}
+              displayField="label"
+              valueField="id"
+              onSelect={({ value, item }) => {
+                setForm((p) => ({
+                  ...p,
+                  siteID: String(value),
+                  customerID: item.customerID ? String(item.customerID) : p.customerID,
+                }));
+                if (item.customer) {
+                  customerIdRef.current = String(item.customerID);
+                  setCustomerLabel(`${item.customer.customerCode} — ${item.customer.customerName}`);
+                }
+                setBranchLabel(item.branchName || item.label?.split(" — ")[0] || "");
+              }}
+            />
+          </div>
+          ) : null}
+          <div className="space-y-2">
+            <Label>Title *</Label>
+            <Input value={form.taskName} onChange={(e) => setForm((p) => ({ ...p, taskName: e.target.value }))} required />
+          </div>
+          <div className="space-y-2">
+            <Label>Description</Label>
+            <Textarea value={form.description} onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))} rows={3} />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-2"><Label>Schedule</Label><Input type="datetime-local" className="cursor-pointer" value={form.scheduleDateTime} onChange={(e) => setForm((p) => ({ ...p, scheduleDateTime: e.target.value }))} /></div>
+            <div className="space-y-2"><Label>Due date & time</Label><Input type="datetime-local" className="cursor-pointer" value={form.dueDateTime} onChange={(e) => setForm((p) => ({ ...p, dueDateTime: e.target.value }))} required={formAssignIds.length > 0 || !!(editingTask?.engineerAssignments?.length || editingTask?.assignments?.length)} /></div>
+          </div>
+          <div className="space-y-2">
+            <Label>Priority</Label>
+            <select className="app-select w-full" value={form.priority} onChange={(e) => setForm((p) => ({ ...p, priority: e.target.value }))}>
+              {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          <div className="space-y-3 rounded-md border border-border p-3">
+            <Label>Assign employees</Label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <SearchSuggestInput
+                label="Department"
+                placeholder="Search department…"
+                value={assignDeptLabel}
+                onChange={(value) => {
+                  setAssignDeptLabel(value);
+                  if (!value) setAssignDeptId("");
+                }}
+                fetchData={searchDepartments}
+                displayField="label"
+                valueField="id"
+                onSelect={({ value, item }) => {
+                  setAssignDeptId(String(value));
+                  setAssignDeptLabel(item.label || "");
+                }}
+              />
+              <SearchSuggestInput
+                key={assignDeptId || "all-designations"}
+                label="Designation"
+                placeholder="Search designation…"
+                value={assignDesigLabel}
+                onChange={(value) => {
+                  setAssignDesigLabel(value);
+                  if (!value) setAssignDesigId("");
+                }}
+                fetchData={searchDesignations}
+                displayField="label"
+                valueField="id"
+                onSelect={({ value, item }) => {
+                  setAssignDesigId(String(value));
+                  setAssignDesigLabel(item.label || "");
+                }}
+              />
+            </div>
+            {!assignDeptId && !assignDesigId ? (
+              <p className="text-sm text-muted-foreground">Search by department or designation to choose employees.</p>
+            ) : formEmployees.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No employees match this search.</p>
+            ) : (
+              <div className="max-h-48 space-y-1 overflow-y-auto">
+                {formEmployees.map((emp) => (
+                  <label key={emp.id} className="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-muted">
+                    <input
+                      type="checkbox"
+                      checked={formAssignIds.includes(emp.id)}
+                      onChange={() => setFormAssignIds((prev) =>
+                        prev.includes(emp.id) ? prev.filter((x) => x !== emp.id) : [...prev, emp.id]
+                      )}
+                      className="size-4 accent-primary"
+                    />
+                    <span className="text-sm text-foreground">
+                      {[emp.employeeFirstName, emp.employeeLastName].filter(Boolean).join(" ")}
+                      <span className="ml-1 text-muted-foreground">({emp.employeeID})</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {formAssignIds.length > 0 ? (
+              <p className="text-xs text-muted-foreground">{formAssignIds.length} employee{formAssignIds.length === 1 ? "" : "s"} selected</p>
+            ) : null}
+          </div>
+          {taskTypeNeedsSite(form.taskType) ? (
+            <TaskContactsRepeater title="Task Contacts" contacts={taskContacts} onChange={setTaskContacts} />
+          ) : null}
+          {editingTask?.workscopeDetails?.length ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Workscope</Label>
+              {editingTask.workscopeDetails.map((row, i) => (
+                <p key={i} className="text-sm text-muted-foreground">{row.workscopeDetails || "—"}{row.extraNote ? ` (${row.extraNote})` : ""}</p>
+              ))}
+            </div>
+          ) : null}
+          {editingTask?.inventories?.length ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Inventory</Label>
+              {editingTask.inventories.map((row, i) => (
+                <p key={i} className="text-sm text-muted-foreground">{[row.makeModel, row.snMac, row.description].filter(Boolean).join(" · ")}</p>
+              ))}
+            </div>
+          ) : null}
+          {editingTask?.purchase ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Purchase</Label>
+              <p className="text-sm text-muted-foreground">{editingTask.purchase.purchaseType} — {editingTask.purchase.customerName}</p>
+            </div>
+          ) : null}
+          {editingTask?.images?.length ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Images</Label>
+              <div className="flex flex-wrap gap-2">
+                {editingTask.images.map((img, i) => img.fileUrl ? (
+                  <a key={i} href={img.fileUrl} target="_blank" rel="noreferrer" className="text-xs text-primary underline">{img.filename || `Image ${i + 1}`}</a>
+                ) : null)}
+              </div>
+            </div>
+          ) : null}
+          {editingTask?.notes?.length ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Notes</Label>
+              {editingTask.notes.map((note, i) => (
+                <p key={i} className="text-sm text-muted-foreground">{note.title || note.note || "Note"}</p>
+              ))}
+            </div>
+          ) : null}
+          {editingTask?.engineerAssignments?.length ? (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>Engineers</Label>
+              {editingTask.engineerAssignments.map((row, i) => (
+                <p key={i} className="text-sm text-muted-foreground">{row.engineerName || row.engineerEmail} {row.status ? `(${row.status})` : ""}</p>
+              ))}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2 pt-4 border-t">
+            <Button type="button" variant="outline" onClick={() => { setFormOpen(false); resetForm(); }}>Cancel</Button>
+            <Button type="submit" disabled={saving}>{saving ? "Saving…" : editingTask ? "Update Task" : "Create Task"}</Button>
+          </div>
+        </form>
+      </FormDrawer>
+
+      <FormDrawer open={detailOpen} onOpenChange={(v) => { if (!v) { setDetailOpen(false); setDetail(null); } }}
+        title="Task Details" showHeaderCancel cancelLabel="Close">
+        {detail && (
+          <div className="space-y-6">
+            <EntityDetailLayout
+              hero={
+                <EntityDetailHero
+                  title={detail.taskName}
+                  subtitle={<span>{detail.taskCode}</span>}
+                />
+              }
+            >
+              <DetailCard
+                title="Overview"
+                subtitle="Task classification and status"
+                rows={[
+                  { label: "Task code", value: detail.taskCode },
+                  { label: "Task type", value: detail.taskType },
+                  { label: "Status", value: detail.status },
+                  { label: "Priority", value: detail.priority },
+                ]}
+              />
+              <DetailCard
+                title="Assignment"
+                subtitle="Organisation and scheduling"
+                rows={[
+                  { label: "Department", value: detail.department?.departmentName },
+                  { label: "Customer", value: detail.customer?.customerName },
+                  { label: "Site", value: detail.site?.branchName },
+                  { label: "Schedule", value: formatTaskDate(detail.scheduleDateTime) },
+                  { label: "Due date", value: formatTaskDate(detail.dueDateTime) },
+                ]}
+              />
+              {detail.description ? (
+                <DetailCard title="Description" subtitle="Task details" className="lg:col-span-2">
+                  <p className="text-sm leading-relaxed text-foreground whitespace-pre-wrap">{detail.description}</p>
+                </DetailCard>
+              ) : null}
+              <DetailCard title="Assignees" subtitle="Employees assigned to this task" className="lg:col-span-2">
+                {(detail.assignments || []).length === 0 ? (
+                  <p className="text-sm text-muted-foreground">Unassigned</p>
+                ) : (
+                  <div className="divide-y divide-border">
+                    {(detail.assignments || []).map((a) => {
+                      const name = [a.manageEmployee?.employeeFirstName, a.manageEmployee?.employeeLastName]
+                        .filter(Boolean)
+                        .join(" ");
+                      return (
+                        <div key={a.manageEmployeeID} className="py-2.5 text-sm font-medium">
+                          {name || "Employee"}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </DetailCard>
+            </EntityDetailLayout>
+
+            <TaskDetailTabs
+              key={detail.id}
+              chats={detail.chats || []}
+              activities={detail.activities || []}
+              currentUserName={user?.username}
+              message={detailChatMsg}
+              onMessageChange={setDetailChatMsg}
+              onSend={sendDetailChat}
+              sending={detailChatSending}
+              showComposer
+            />
+          </div>
+        )}
+      </FormDrawer>
+
+      {chatTask && (
+        <TaskRemarksChatbox open={chatOpen} onClose={() => { setChatOpen(false); setChatTask(null); }}
+          taskCode={chatTask.taskCode} status={chatTask.status}
+          chats={chatTask.chats || []} activities={chatTask.activities || []}
+          message={chatMsg} onMessageChange={setChatMsg}
+          statusValue={chatStatus} onStatusChange={applyChatStatus}
+          statusOptions={NEXT_TASK_STATUS[chatTask.status as TaskStatus] ? [NEXT_TASK_STATUS[chatTask.status as TaskStatus]] : []}
+          onSend={sendChat} sending={chatSending} />
+      )}
+
+      {/* Assign Employees Modal */}
+      {assignTask && typeof document !== "undefined" ? createPortal(
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-[min(440px,calc(100vw-2rem))] overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <div>
+                <p className="font-semibold text-gray-900">Assign Employees</p>
+                <p className="text-[11px] font-mono text-gray-400 mt-0.5">{assignTask.taskCode}</p>
+              </div>
+              <button type="button" onClick={() => setAssignTask(null)} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500">✕</button>
+            </div>
+            <div className="px-5 py-4 space-y-3 max-h-[70vh] overflow-y-auto">
+              <div className="space-y-2">
+                <Label htmlFor="assign-due">Due date & time</Label>
+                <Input
+                  id="assign-due"
+                  type="datetime-local"
+                  className="cursor-pointer"
+                  value={assignDue}
+                  onChange={(e) => setAssignDue(e.target.value)}
+                  required={assignIds.length > 0}
+                />
+              </div>
+              {assignEmployees.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">
+                  No employees found in this department
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {assignEmployees.map((emp) => (
+                    <label key={emp.id} className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-gray-50 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={assignIds.includes(emp.id)}
+                        onChange={() => setAssignIds((prev) =>
+                          prev.includes(emp.id) ? prev.filter((x) => x !== emp.id) : [...prev, emp.id]
+                        )}
+                        className="w-4 h-4 accent-violet-600"
+                      />
+                      <span className="text-[13px] text-gray-800">
+                        {[emp.employeeFirstName, emp.employeeLastName].filter(Boolean).join(" ")}
+                        <span className="text-gray-400 ml-1">({emp.employeeID})</span>
+                        {emp.companyName ? (
+                          <span className="text-gray-400 ml-1">· {emp.companyName}</span>
+                        ) : null}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+              <Button variant="outline" onClick={() => setAssignTask(null)}>Cancel</Button>
+              <Button onClick={saveAssign} disabled={assignSaving} className="bg-violet-600 hover:bg-violet-700">
+                {assignSaving ? "Saving…" : "Save Assignment"}
+              </Button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+    </div>
+  );
+}

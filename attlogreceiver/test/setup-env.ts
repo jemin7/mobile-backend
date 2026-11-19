@@ -1,0 +1,9 @@
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_URL = 'postgresql://postgres@127.0.0.1:5432/ATTLOG_DB_TEST';
+process.env.RECEIVER_KEY = 'test-receiver-key';
+process.env.ADMIN_AUTH_SECRET = 'test-admin-secret';
+process.env.DAHUA_BASIC_USER = 'dahua';
+process.env.DAHUA_BASIC_PASSWORD = 'dahua-secret';
+process.env.TIMEZONE = 'Asia/Kolkata';
+process.env.WORKER_EMBEDDED = 'false';
+process.env.DEVICE_IP_ALLOWLIST = '';

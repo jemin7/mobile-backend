@@ -1,0 +1,1836 @@
+import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { wallClockInZoneToStorageDate } from '../common/device-punch-time';
+import { PrismaService } from '../prisma/prisma.service';
+import {
+  collapsePunchBursts,
+  computeDayStatus,
+  type ComputeDayStatusInput,
+  parsePunchTime,
+  statusDisplayLabel,
+  timeToMinutes,
+  WEEKDAYS,
+} from './attendance-status.engine';
+
+export type TodayOverviewQuery = {
+  companyID?: number;
+  branchId?: number;
+  departmentId?: number;
+  serviceProviderID?: number;
+};
+
+function dateKeyLocal(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function listDatesInclusive(from: string, to: string): string[] {
+  const out: string[] = [];
+  const cur = new Date(`${from}T12:00:00`);
+  const end = new Date(`${to}T12:00:00`);
+  while (cur <= end) {
+    out.push(dateKeyLocal(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+function nextDateKey(date: string): string {
+  const d = new Date(`${date}T12:00:00`);
+  d.setDate(d.getDate() + 1);
+  return dateKeyLocal(d);
+}
+
+type PunchMap = Map<number, Record<string, string[]>>;
+
+function sortPunchTimes(times: string[]): string[] {
+  return [...times].sort((a, b) => timeToMinutes(a) - timeToMinutes(b));
+}
+
+/**
+ * Drop exact duplicate punch times, then collapse accidental burst punches
+ * (rapid re-taps within MIN_PUNCH_GAP_MIN) so a stray punch a minute after
+ * check-in is never paired as the check-out.
+ */
+function dedupeSortedPunches(times: string[]): string[] {
+  const sorted = sortPunchTimes(times);
+  const exact: string[] = [];
+  for (const t of sorted) {
+    if (exact.length === 0 || exact[exact.length - 1] !== t) exact.push(t);
+  }
+  return collapsePunchBursts(exact);
+}
+
+function punchInOut(times: string[]): { inTime: string | null; outTime: string | null } {
+  const sorted = dedupeSortedPunches(times);
+  if (sorted.length === 0) return { inTime: null, outTime: null };
+  if (sorted.length === 1) {
+    return { inTime: sorted[0].slice(0, 5), outTime: null };
+  }
+  return {
+    inTime: sorted[0].slice(0, 5),
+    outTime: sorted[sorted.length - 1].slice(0, 5),
+  };
+}
+
+/** Wall-clock time string from a PWA punch Date (stored as UTC components). */
+function pwaPunchTimeStr(d: Date): string {
+  const h = String(d.getUTCHours()).padStart(2, '0');
+  const m = String(d.getUTCMinutes()).padStart(2, '0');
+  const s = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
+
+type PwaDayRecord = { checkType: string; checkinTime: Date };
+
+/**
+ * PWA uses explicit CHECK_IN / CHECK_OUT — not alternating anonymous punches.
+ * Only these types count toward in/out display and status (break punches excluded).
+ */
+function pwaAttendancePunchTimes(records: PwaDayRecord[]): string[] {
+  const checkIns = records
+    .filter((r) => r.checkType === 'CHECK_IN')
+    .sort((a, b) => a.checkinTime.getTime() - b.checkinTime.getTime());
+  const checkOuts = records
+    .filter((r) => r.checkType === 'CHECK_OUT')
+    .sort((a, b) => a.checkinTime.getTime() - b.checkinTime.getTime());
+  const times: string[] = [];
+  if (checkIns.length > 0) times.push(pwaPunchTimeStr(checkIns[0].checkinTime));
+  if (checkOuts.length > 0) times.push(pwaPunchTimeStr(checkOuts[checkOuts.length - 1].checkinTime));
+  return times;
+}
+
+function pwaPunchInOut(records: PwaDayRecord[]): { inTime: string | null; outTime: string | null } {
+  const checkIns = records
+    .filter((r) => r.checkType === 'CHECK_IN')
+    .sort((a, b) => a.checkinTime.getTime() - b.checkinTime.getTime());
+  const checkOuts = records
+    .filter((r) => r.checkType === 'CHECK_OUT')
+    .sort((a, b) => a.checkinTime.getTime() - b.checkinTime.getTime());
+  return {
+    inTime: checkIns.length > 0 ? pwaPunchTimeStr(checkIns[0].checkinTime).slice(0, 5) : null,
+    outTime:
+      checkOuts.length > 0
+        ? pwaPunchTimeStr(checkOuts[checkOuts.length - 1].checkinTime).slice(0, 5)
+        : null,
+  };
+}
+
+@Injectable()
+export class DashboardOverviewService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async getTodayOverview(query: TodayOverviewQuery) {
+    const nowDate = new Date();
+    const today = dateKeyLocal(nowDate);
+    const monthStart = `${today.slice(0, 7)}-01`;
+    const yesterdayDate = new Date(`${today}T12:00:00`);
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterday = dateKeyLocal(yesterdayDate);
+    const historyStart = yesterday < monthStart ? yesterday : monthStart;
+    const tomorrow = nextDateKey(today);
+    const wallNow = wallClockInZoneToStorageDate(nowDate);
+    const nowMin = wallNow.getUTCHours() * 60 + wallNow.getUTCMinutes();
+
+    const employeeWhere: Prisma.ManageEmployeeWhereInput = {
+      isDeleted: false,
+      lifecycleStatus: 'ACTIVE',
+      OR: [
+        { employmentStatus: null },
+        { employmentStatus: { not: 'Terminated' } },
+      ],
+    };
+    if (query.companyID != null) {
+      employeeWhere.companyID = query.companyID;
+    }
+    if (query.serviceProviderID != null) {
+      employeeWhere.serviceProviderID = query.serviceProviderID;
+    }
+    if (query.branchId != null) employeeWhere.branchesID = query.branchId;
+    if (query.departmentId != null) {
+      employeeWhere.departmentNameID = query.departmentId;
+    }
+
+    let employees = await this.prisma.manageEmployee.findMany({
+      where: employeeWhere,
+      select: {
+        id: true,
+        companyID: true,
+        branchesID: true,
+        departmentNameID: true,
+        designationID: true,
+        employeeFirstName: true,
+        employeeLastName: true,
+        departments: { select: { departmentName: true } },
+        designations: { select: { designation: true } },
+        workShiftID: true,
+        attendancePolicyID: true,
+        mobileAttendanceEnabled: true,
+        maxHoursPerDay: true,
+        workShift: { include: { workShiftDay: true } },
+        attendancePolicy: true,
+        empWorkShift: {
+          take: 1,
+          orderBy: { id: 'desc' },
+          include: {
+            workShift: { include: { workShiftDay: true } },
+          },
+        },
+        empAttendancePolicy: {
+          take: 1,
+          orderBy: { id: 'desc' },
+          include: { attendancePolicy: true },
+        },
+      },
+    });
+
+    if (employees.length > 0) {
+      const approvedTerminations = await this.prisma.employeeTermination.findMany({
+        where: {
+          employeeId: { in: employees.map((e) => e.id) },
+          exitStatus: 'APPROVED',
+          lastWorkingDay: { not: null },
+        },
+        select: { employeeId: true, lastWorkingDay: true },
+      });
+      const inactiveAfterOffboarding = new Set<number>();
+      for (const t of approvedTerminations) {
+        if (
+          t.lastWorkingDay &&
+          dateKeyLocal(new Date(t.lastWorkingDay)) <= today
+        ) {
+          inactiveAfterOffboarding.add(t.employeeId);
+        }
+      }
+      if (inactiveAfterOffboarding.size > 0) {
+        employees = employees.filter((e) => !inactiveAfterOffboarding.has(e.id));
+      }
+    }
+
+    if (employees.length === 0) {
+      return this.emptyResponse(today, query);
+    }
+
+    const empIds = employees.map((e) => e.id);
+    const mobileEmpIds = employees.filter((e) => e.mobileAttendanceEnabled).map((e) => e.id);
+    const companyIds = [...new Set(employees.map((e) => e.companyID).filter(Boolean))] as number[];
+    const branchIds = [...new Set(employees.map((e) => e.branchesID).filter(Boolean))] as number[];
+    const policyIds = [
+      ...new Set(
+        employees
+          .map((e) => e.attendancePolicyID)
+          .filter((id): id is number => id != null),
+      ),
+    ];
+    const shiftIds = [
+      ...new Set(
+        employees.map((e) => e.workShiftID).filter((id): id is number => id != null),
+      ),
+    ];
+
+    const branchPolicyOr = companyIds.flatMap((cid) =>
+      branchIds.map((bid) => ({ companyID: cid, branchesID: bid })),
+    );
+    const policyOrClauses = [
+      ...(policyIds.length > 0 ? [{ id: { in: policyIds } }] : []),
+      ...branchPolicyOr,
+    ];
+    const shiftOrClauses = [
+      ...(shiftIds.length > 0 ? [{ id: { in: shiftIds } }] : []),
+      ...companyIds.flatMap((cid) =>
+        branchIds.map((bid) => ({ companyID: cid, branchesID: bid })),
+      ),
+    ];
+
+    const [
+      processLogs,
+      policies,
+      workShifts,
+      regularizations,
+      leaves,
+      rosters,
+      publicHolidays,
+      absentDeclarations,
+    ] = await Promise.all([
+      this.prisma.process_att_logs.findMany({
+        where: {
+          manage_employee_id: { in: empIds },
+          // Month start → tomorrow, plus yesterday when the month just turned.
+          punch_time: {
+            gte: new Date(`${historyStart}T00:00:00`),
+            lte: new Date(`${tomorrow}T23:59:59`),
+          },
+        },
+        select: { manage_employee_id: true, punch_time: true, device_sn: true },
+        orderBy: { punch_time: 'asc' },
+        take: 200000,
+      }),
+      policyOrClauses.length > 0
+        ? this.prisma.attendancePolicy.findMany({ where: { OR: policyOrClauses } })
+        : Promise.resolve([]),
+      shiftOrClauses.length > 0
+        ? this.prisma.workShift.findMany({
+            where: { OR: shiftOrClauses },
+            include: { workShiftDay: true },
+          })
+        : Promise.resolve([]),
+      this.prisma.empAttendanceRegularise.findMany({
+        where: {
+          manageEmployeeID: { in: empIds },
+          status: 'Approved',
+        },
+      }),
+      this.prisma.leaveApplication.findMany({
+        where: {
+          manageEmployeeID: { in: empIds },
+          status: 'Approved',
+        },
+      }),
+      this.prisma.roster.findMany({
+        where: {
+          companyID: query.companyID ?? { in: companyIds },
+          branchesID: query.branchId ?? { in: branchIds },
+        },
+        include: {
+          employees: {
+            where: { employeeID: { in: empIds } },
+            include: {
+              days: { include: { workShift: { include: { workShiftDay: true } } } },
+            },
+          },
+        },
+      }),
+      this.prisma.publicHoliday.findMany({
+        where: {
+          companyID: query.companyID ?? { in: companyIds },
+        },
+      }),
+      this.prisma.empAbsentDeclaration.findMany({
+        where: {
+          employeeId: { in: empIds },
+          absentDate: {
+            gte: new Date(`${monthStart}T00:00:00`),
+            lte: new Date(`${tomorrow}T23:59:59`),
+          },
+        },
+      }),
+    ]);
+
+    const pwaByEmp = new Map<number, PwaDayRecord[]>();
+    if (mobileEmpIds.length > 0) {
+      const pwaToday = await this.prisma.attendanceLocation.findMany({
+        where: {
+          employeeId: { in: mobileEmpIds },
+          checkinTime: {
+            gte: new Date(`${today}T00:00:00`),
+            lte: new Date(`${tomorrow}T00:00:00`),
+          },
+        },
+        select: { employeeId: true, checkType: true, checkinTime: true },
+        orderBy: { checkinTime: 'asc' },
+      });
+      for (const r of pwaToday) {
+        if (!pwaByEmp.has(r.employeeId)) pwaByEmp.set(r.employeeId, []);
+        pwaByEmp.get(r.employeeId)!.push({
+          checkType: r.checkType,
+          checkinTime: r.checkinTime,
+        });
+      }
+    }
+
+    // Today's punch rows with location/source detail (small, today-only query).
+    // Used to surface the exact punch address + whether it came from the mobile
+    // app (GPS) or a biometric device on the admin dashboard.
+    const todayLocationLogs = await this.prisma.process_att_logs.findMany({
+      where: {
+        manage_employee_id: { in: empIds },
+        punch_time: {
+          gte: new Date(`${today}T00:00:00`),
+          lte: new Date(`${tomorrow}T00:00:00`),
+        },
+      },
+      select: {
+        manage_employee_id: true,
+        punch_time: true,
+        device_sn: true,
+        device_id: true,
+        device_name: true,
+        raw_body: true,
+      },
+      orderBy: { punch_time: 'asc' },
+    });
+
+    const deviceSnSet = new Set<string>();
+    const deviceIdSet = new Set<number>();
+    for (const log of todayLocationLogs) {
+      if (log.device_sn && log.device_sn !== 'LOCATION_APP') deviceSnSet.add(log.device_sn);
+      if (log.device_id != null) deviceIdSet.add(log.device_id);
+    }
+    const deviceLocOr: Prisma.DevicesWhereInput[] = [];
+    if (deviceIdSet.size > 0) deviceLocOr.push({ id: { in: [...deviceIdSet] } });
+    if (deviceSnSet.size > 0) deviceLocOr.push({ deviceSN: { in: [...deviceSnSet] } });
+    const deviceRows =
+      deviceLocOr.length > 0
+        ? await this.prisma.devices.findMany({
+            where: { OR: deviceLocOr },
+            select: { id: true, deviceSN: true, address: true, latitude: true, longitude: true },
+          })
+        : [];
+    const addressByDeviceId = new Map<number, string | null>();
+    const addressByDeviceSn = new Map<string, string | null>();
+    for (const d of deviceRows) {
+      const addr = d.address?.trim() || null;
+      addressByDeviceId.set(d.id, addr);
+      addressByDeviceSn.set(d.deviceSN, addr);
+    }
+
+    type PunchLoc = { source: 'app' | 'device'; address: string | null; deviceName: string | null };
+    const locByEmp = new Map<number, { first: PunchLoc; last: PunchLoc }>();
+    for (const log of todayLocationLogs) {
+      const empId = log.manage_employee_id;
+      if (empId == null || !log.punch_time) continue;
+      const dk = dateKeyLocal(new Date(log.punch_time));
+      if (dk !== today) continue;
+      const isApp = log.device_sn === 'LOCATION_APP';
+      let address: string | null = null;
+      if (isApp && log.raw_body) {
+        try {
+          address = JSON.parse(log.raw_body)?.address ?? null;
+        } catch {
+          address = null;
+        }
+      } else if (!isApp) {
+        address =
+          (log.device_id != null ? addressByDeviceId.get(log.device_id) : null) ??
+          (log.device_sn ? addressByDeviceSn.get(log.device_sn) : null) ??
+          null;
+      }
+      const loc: PunchLoc = {
+        source: isApp ? 'app' : 'device',
+        address,
+        deviceName: log.device_name ?? null,
+      };
+      const existing = locByEmp.get(empId);
+      if (!existing) locByEmp.set(empId, { first: loc, last: loc });
+      else existing.last = loc;
+    }
+
+    const formatPunchLocation = (loc: PunchLoc | undefined): string | null => {
+      if (!loc) return null;
+      return loc.address || null;
+    };
+
+    // Per-employee attendance channel: mobile-attendance employees count only
+    // PWA (LOCATION_APP) punches; everyone else counts only device punches.
+    // This enforces device/mobile exclusivity even for already-synced rows.
+    const mobileEnabledById = new Map<number, boolean>(
+      employees.map((e) => [e.id, !!e.mobileAttendanceEnabled]),
+    );
+
+    const punchMap: PunchMap = new Map();
+    for (const log of processLogs) {
+      if (log.manage_employee_id == null || !log.punch_time) continue;
+      const parsed = parsePunchTime(String(log.punch_time));
+      if (!parsed) continue;
+      if (parsed.dateKey < historyStart || parsed.dateKey > tomorrow) continue;
+
+      const empId = log.manage_employee_id;
+      const isAppPunch = log.device_sn === 'LOCATION_APP';
+      const mobileEnabled = mobileEnabledById.get(empId) ?? false;
+      // Drop the channel that does not apply to this employee.
+      if (mobileEnabled ? !isAppPunch : isAppPunch) continue;
+
+      if (!punchMap.has(empId)) punchMap.set(empId, {});
+      const row = punchMap.get(empId)!;
+      if (!row[parsed.dateKey]) row[parsed.dateKey] = [];
+      row[parsed.dateKey].push(parsed.timeStr);
+      row[parsed.dateKey] = dedupeSortedPunches(row[parsed.dateKey]);
+    }
+
+    const shiftById = new Map(
+      (workShifts as Array<{ id: number } & (typeof workShifts)[0]>).map(
+        (s) => [s.id, s] as const,
+      ),
+    );
+    const policyById = new Map(
+      (policies as Array<{ id: number } & (typeof policies)[0]>).map(
+        (p) => [p.id, p] as const,
+      ),
+    );
+
+    const rosterByEmployee = new Map<number, (typeof rosters)[0]['employees'][0]>();
+    for (const roster of rosters) {
+      for (const re of roster.employees) {
+        rosterByEmployee.set(re.employeeID, re);
+      }
+    }
+
+    const policyByBranch = new Map<string, (typeof policies)[0]>();
+    for (const p of policies) {
+      if (p.companyID != null && p.branchesID != null) {
+        policyByBranch.set(`${p.companyID}-${p.branchesID}`, p);
+      }
+    }
+
+    const regByEmpDate = new Map<string, (typeof regularizations)[0]>();
+    for (const r of regularizations) {
+      if (!r.manageEmployeeID || !r.attendanceDate) continue;
+      const dk = dateKeyLocal(new Date(r.attendanceDate));
+      regByEmpDate.set(`${r.manageEmployeeID}-${dk}`, r);
+    }
+
+    const leaveByEmpDate = new Map<string, (typeof leaves)[0]>();
+    for (const l of leaves) {
+      if (!l.manageEmployeeID || !l.fromDate || !l.toDate) continue;
+      const from = dateKeyLocal(new Date(l.fromDate));
+      const to = dateKeyLocal(new Date(l.toDate));
+      for (const d of listDatesInclusive(from, to)) {
+        leaveByEmpDate.set(`${l.manageEmployeeID}-${d}`, l);
+      }
+    }
+
+    const absentByEmpDate = new Set<string>();
+    for (const a of absentDeclarations) {
+      absentByEmpDate.add(`${a.employeeId}-${dateKeyLocal(new Date(a.absentDate))}`);
+    }
+
+    const summary = {
+      total: employees.length,
+      present: 0,
+      absent: 0,
+      lateMark: 0,
+      halfDay: 0,
+      noCheckout: 0,
+      onLeave: 0,
+      weekOff: 0,
+      holiday: 0,
+      ot: 0,
+      regularized: 0,
+    };
+
+    const statusCounts: Record<string, number> = {};
+    const rows: Array<{
+      id: number;
+      employeeFirstName: string;
+      employeeLastName: string;
+      branchesID: number;
+      departmentNameID: number | null;
+      departmentName: string | null;
+      designationName: string | null;
+      inTime: string | null;
+      outTime: string | null;
+      statusType: string;
+      statusLabel: string;
+      statusDisplay: string;
+      hasPunches: boolean;
+      inLocation: string | null;
+      outLocation: string | null;
+    }> = [];
+
+    const trackerDates = listDatesInclusive(monthStart, today);
+    const datesBeforeToday = trackerDates.filter((d) => d < today);
+    const yesterdayStatusDates = datesBeforeToday.includes(yesterday)
+      ? datesBeforeToday
+      : [yesterday, ...datesBeforeToday];
+    const yesterdayMissingCheckout: Array<{
+      id: number;
+      employeeFirstName: string;
+      employeeLastName: string;
+      inTime: string | null;
+      outTime: string | null;
+      statusType: string;
+      statusDisplay: string;
+      hasPunches: boolean;
+    }> = [];
+
+    for (const emp of employees) {
+      const empPunches = punchMap.get(emp.id) || {};
+      const lateMarkTracker = new Map<string, number>();
+      const noCheckoutTracker = new Map<string, number>();
+
+      const empShiftLink = emp.empWorkShift[0];
+      let workShift =
+        empShiftLink?.workShift ||
+        emp.workShift ||
+        (emp.workShiftID ? shiftById.get(emp.workShiftID) : undefined);
+      if (
+        workShift?.id &&
+        (!workShift.workShiftDay || workShift.workShiftDay.length === 0)
+      ) {
+        const fullShift = shiftById.get(workShift.id);
+        if (fullShift) workShift = fullShift;
+      }
+
+      const rosterEmp = rosterByEmployee.get(emp.id);
+      const rosterDayToday = rosterEmp?.days?.find(
+        (d) => dateKeyLocal(new Date(d.workDate)) === today,
+      );
+
+      if (rosterDayToday?.dayType === 'WORK' && rosterDayToday.workShiftID) {
+        const rosterShift =
+          shiftById.get(rosterDayToday.workShiftID) ||
+          rosterDayToday.workShift;
+        if (rosterShift) workShift = rosterShift;
+      }
+
+      const policy =
+        emp.empAttendancePolicy[0]?.attendancePolicy ||
+        emp.attendancePolicy ||
+        (emp.attendancePolicyID
+          ? policyById.get(emp.attendancePolicyID)
+          : undefined) ||
+        policyByBranch.get(`${emp.companyID}-${emp.branchesID}`) ||
+        null;
+
+      const ctxBase: Omit<
+        ComputeDayStatusInput,
+        'date' | 'punches' | 'nextDayPunches' | 'lateMarkTracker' | 'noCheckoutTracker'
+      > = {
+        employeeId: emp.id,
+        companyId: emp.companyID!,
+        branchId: emp.branchesID!,
+        workShift: (workShift || null) as ComputeDayStatusInput['workShift'],
+        rosterDay: rosterDayToday
+          ? {
+              dayType: rosterDayToday.dayType,
+              workShift: (rosterDayToday.workShift ||
+                (rosterDayToday.workShiftID
+                  ? shiftById.get(rosterDayToday.workShiftID)
+                  : null)) as ComputeDayStatusInput['workShift'],
+            }
+          : null,
+        policy: policy as ComputeDayStatusInput['policy'],
+        publicHolidays: publicHolidays as ComputeDayStatusInput['publicHolidays'],
+        actualMode: true,
+      };
+
+      for (const date of yesterdayStatusDates) {
+        const punches = empPunches[date] || [];
+        const nextDayPunches = empPunches[nextDateKey(date)] || [];
+        const rosterDay = rosterEmp?.days?.find(
+          (d) => dateKeyLocal(new Date(d.workDate)) === date,
+        );
+
+        const priorStatus = computeDayStatus({
+          ...ctxBase,
+          date,
+          punches,
+          nextDayPunches,
+          regularization: regByEmpDate.get(`${emp.id}-${date}`),
+          leave: leaveByEmpDate.get(`${emp.id}-${date}`),
+          absentDeclared: absentByEmpDate.has(`${emp.id}-${date}`),
+          lateMarkTracker,
+          noCheckoutTracker,
+        });
+        if (date === yesterday && priorStatus.type === 'SINGLE_PUNCH') {
+          const punched = punchInOut(punches);
+          yesterdayMissingCheckout.push({
+            id: emp.id,
+            employeeFirstName: emp.employeeFirstName || '',
+            employeeLastName: emp.employeeLastName || '',
+            inTime: punched.inTime,
+            outTime: punched.outTime,
+            statusType: priorStatus.type,
+            statusDisplay: statusDisplayLabel(priorStatus.type, priorStatus.label),
+            hasPunches: priorStatus.hasPunches,
+          });
+        }
+      }
+
+      const mobileEnabled = !!emp.mobileAttendanceEnabled;
+      const pwaToday = pwaByEmp.get(emp.id) || [];
+      const todayPunches = mobileEnabled
+        ? pwaAttendancePunchTimes(pwaToday)
+        : empPunches[today] || [];
+      const nextDayPunches = empPunches[tomorrow] || [];
+      const status = computeDayStatus({
+        ...ctxBase,
+        date: today,
+        punches: todayPunches,
+        nextDayPunches,
+        regularization: regByEmpDate.get(`${emp.id}-${today}`),
+        leave: leaveByEmpDate.get(`${emp.id}-${today}`),
+        absentDeclared: absentByEmpDate.has(`${emp.id}-${today}`),
+        lateMarkTracker,
+        noCheckoutTracker,
+        dayInProgress: true,
+      });
+
+      // While an employee has checked in but not yet checked out, the day is
+      // still in progress — show "Present" instead of "No checkout" until the
+      // shift end (+ checkout buffer) and the employee's max working hours have
+      // passed. Only after that window do we surface a missing check-out.
+      let effStatus = status;
+      if (status.type === 'SINGLE_PUNCH') {
+        const firstPunch = todayPunches[0] || null;
+        if (firstPunch) {
+          const dow = WEEKDAYS[new Date(`${today}T12:00:00`).getDay()];
+          const todayShiftDay = (workShift?.workShiftDay || []).find(
+            (d) => d.weekDay === dow && d.shiftType === 'WORK',
+          );
+          const maxHours = parseFloat(String(emp.maxHoursPerDay || '')) || 0;
+          const firstMin = timeToMinutes(firstPunch);
+          let windowEnd = 0;
+          if (todayShiftDay) {
+            const startMin = timeToMinutes(todayShiftDay.startTime || '');
+            const endMin = timeToMinutes(todayShiftDay.endTime || '');
+            const spansMidnight = endMin < startMin;
+            const buffer = (policy?.checkout_end_after_min as number) || 0;
+            windowEnd = (spansMidnight ? endMin + 1440 : endMin) + buffer;
+          }
+          if (maxHours > 0) windowEnd = Math.max(windowEnd, firstMin + maxHours * 60);
+          if (windowEnd === 0) windowEnd = firstMin + (maxHours > 0 ? maxHours * 60 : 600);
+          const nowNightAware = nowMin < firstMin ? nowMin + 1440 : nowMin;
+          if (nowNightAware <= windowEnd) {
+            effStatus = { ...status, type: 'PRESENT', label: 'P' };
+          } else {
+            effStatus = { ...status, type: 'SINGLE_PUNCH', label: 'no checkout' };
+          }
+        }
+      }
+
+      statusCounts[effStatus.type] = (statusCounts[effStatus.type] || 0) + 1;
+
+      const { inTime, outTime } = mobileEnabled
+        ? pwaPunchInOut(pwaToday)
+        : punchInOut(empPunches[today] || []);
+
+      switch (effStatus.type) {
+        case 'PRESENT':
+        case 'OT':
+          summary.present++;
+          break;
+        case 'LATE_MARK':
+          summary.present++;
+          summary.lateMark++;
+          break;
+        case 'HALF_DAY':
+          summary.halfDay++;
+          if (!effStatus.hasPunches) summary.absent++;
+          break;
+        case 'SINGLE_PUNCH':
+          summary.noCheckout++;
+          summary.present++;
+          break;
+        case 'ABSENT':
+          summary.absent++;
+          break;
+        case 'LEAVE':
+          summary.onLeave++;
+          break;
+        case 'WEEK_OFF':
+          summary.weekOff++;
+          break;
+        case 'HOLIDAY':
+          summary.holiday++;
+          break;
+        case 'REGULARIZATION':
+          summary.regularized++;
+          if (effStatus.hasPunches) summary.present++;
+          break;
+        default:
+          if (effStatus.hasPunches) summary.present++;
+          else summary.absent++;
+      }
+
+      const empLoc = locByEmp.get(emp.id);
+      rows.push({
+        id: emp.id,
+        employeeFirstName: emp.employeeFirstName || '',
+        employeeLastName: emp.employeeLastName || '',
+        branchesID: emp.branchesID!,
+        departmentNameID: emp.departmentNameID,
+        departmentName: emp.departments?.departmentName ?? null,
+        designationName: emp.designations?.designation ?? null,
+        inTime,
+        outTime,
+        statusType: effStatus.type,
+        statusLabel: effStatus.label,
+        statusDisplay: statusDisplayLabel(effStatus.type, effStatus.label),
+        hasPunches: effStatus.hasPunches,
+        inLocation: formatPunchLocation(empLoc?.first),
+        outLocation: outTime ? formatPunchLocation(empLoc?.last) : null,
+      });
+    }
+
+    rows.sort((a, b) =>
+      `${a.employeeFirstName} ${a.employeeLastName}`.localeCompare(
+        `${b.employeeFirstName} ${b.employeeLastName}`,
+      ),
+    );
+
+    yesterdayMissingCheckout.sort((a, b) =>
+      `${a.employeeFirstName} ${a.employeeLastName}`.localeCompare(
+        `${b.employeeFirstName} ${b.employeeLastName}`,
+      ),
+    );
+
+    return {
+      date: today,
+      yesterday,
+      filters: {
+        companyID: query.companyID ?? null,
+        branchId: query.branchId ?? null,
+        departmentId: query.departmentId ?? null,
+      },
+      summary,
+      statusCounts,
+      employees: rows,
+      yesterdayMissingCheckout,
+    };
+  }
+
+  private parseProbationMonths(text: string | null | undefined): number | null {
+    if (!text?.trim()) return null;
+    const m = text.trim().match(/(\d+)/);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  private addMonthsToDateKey(dateKey: string, months: number): string {
+    const d = new Date(`${dateKey}T12:00:00`);
+    d.setMonth(d.getMonth() + months);
+    return dateKeyLocal(d);
+  }
+
+  async getProbationAlerts(query: {
+    companyID?: number;
+    branchId?: number;
+    daysAhead?: number;
+  }) {
+    const daysAhead = query.daysAhead ?? 60;
+    const today = dateKeyLocal(new Date());
+    const horizon = new Date(`${today}T12:00:00`);
+    horizon.setDate(horizon.getDate() + daysAhead);
+    const horizonKey = dateKeyLocal(horizon);
+
+    const where: Record<string, unknown> = { isDeleted: false };
+    if (query.companyID != null) where.companyID = query.companyID;
+    if (query.branchId != null) where.branchesID = query.branchId;
+
+    const employees = await this.prisma.manageEmployee.findMany({
+      where,
+      select: {
+        id: true,
+        employeeID: true,
+        employeeFirstName: true,
+        employeeLastName: true,
+        joiningDate: true,
+        companyID: true,
+        branchesID: true,
+        empEmploymentStatus: {
+          orderBy: { id: 'desc' },
+          take: 5,
+        },
+      },
+    });
+
+    const alerts: {
+      employeeId: number;
+      employeeCode: string | null;
+      employeeName: string;
+      probationPeriod: string;
+      employmentStatus: string;
+      effectFrom: string;
+      probationEndDate: string;
+      daysRemaining: number;
+      isOverdue: boolean;
+    }[] = [];
+
+    for (const emp of employees) {
+      const current =
+        emp.empEmploymentStatus.find((s) => s.employmentStatus === 'Probation') ??
+        emp.empEmploymentStatus[0];
+      if (!current || current.employmentStatus !== 'Probation') continue;
+
+      const months = this.parseProbationMonths(current.probationPeriod);
+      if (!months) continue;
+
+      const startKey =
+        (current.effectFrom && String(current.effectFrom).slice(0, 10)) ||
+        (emp.joiningDate && String(emp.joiningDate).slice(0, 10));
+      if (!startKey) continue;
+
+      const endKey = this.addMonthsToDateKey(startKey, months);
+      if (endKey > horizonKey) continue;
+
+      const endMs = new Date(`${endKey}T12:00:00`).getTime();
+      const todayMs = new Date(`${today}T12:00:00`).getTime();
+      const daysRemaining = Math.ceil((endMs - todayMs) / 86400000);
+
+      alerts.push({
+        employeeId: emp.id,
+        employeeCode: emp.employeeID,
+        employeeName:
+          `${emp.employeeFirstName ?? ''} ${emp.employeeLastName ?? ''}`.trim() ||
+          `#${emp.id}`,
+        probationPeriod: current.probationPeriod ?? `${months} months`,
+        employmentStatus: current.employmentStatus ?? 'Probation',
+        effectFrom: startKey,
+        probationEndDate: endKey,
+        daysRemaining,
+        isOverdue: daysRemaining < 0,
+      });
+    }
+
+    alerts.sort((a, b) => a.daysRemaining - b.daysRemaining);
+    return { today, daysAhead, alerts };
+  }
+
+  async getHrWidgets(query: TodayOverviewQuery) {
+    const today = new Date();
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1, 0, 0, 0, 0);
+    const nextMonthStart = new Date(today.getFullYear(), today.getMonth() + 1, 1, 0, 0, 0, 0);
+    const employeeWhere: Prisma.ManageEmployeeWhereInput = {
+      isDeleted: false,
+      OR: [
+        { employmentStatus: null },
+        { employmentStatus: { not: 'Terminated' } },
+      ],
+    };
+    if (query.companyID) employeeWhere.companyID = query.companyID;
+    if (query.branchId) employeeWhere.branchesID = query.branchId;
+    if (query.serviceProviderID) employeeWhere.serviceProviderID = query.serviceProviderID;
+
+    const taskWhere: Prisma.TaskProjectWhereInput = {
+      isDeleted: false,
+      ...(query.companyID ? { companyID: query.companyID } : {}),
+      ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+    };
+
+    const leaveWhere: Prisma.leaveApplicationWhereInput = {
+      status: { in: ['Pending', 'Partially Approved'] },
+      ...(query.companyID ? { companyID: query.companyID } : {}),
+      ...(query.branchId ? { branchesID: query.branchId } : {}),
+      ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+    };
+
+    const reimbWhere: Prisma.ReimbursementWhereInput = {
+      status: 'Pending',
+      ...(query.companyID ? { companyID: query.companyID } : {}),
+      ...(query.branchId ? { branchesID: query.branchId } : {}),
+      ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+    };
+
+    const advanceWhere: Prisma.SalaryAdvanceWhereInput = {
+      status: 'Pending',
+      ...(query.companyID ? { companyID: query.companyID } : {}),
+      ...(query.branchId ? { branchesID: query.branchId } : {}),
+      ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+    };
+
+    const memoWhere: Prisma.EmployeeMemoWhereInput = {
+      parentMemoId: null,
+      undoneAt: null,
+      ...(query.companyID ? { companyID: query.companyID } : {}),
+      ...(query.branchId ? { branchesID: query.branchId } : {}),
+      ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+    };
+
+    const [
+      imCount,
+      taskCount,
+      reimbursementCount,
+      leaveCount,
+      salaryAdvanceCount,
+      latestTasks,
+      employees,
+      holidays,
+      company,
+      recentLeaves,
+      recentMemos,
+      recentCreatedEmployees,
+      recentPayroll,
+      recentTaskCreates,
+      recentPunches,
+      recentMobilePunches,
+      newJoinersThisMonth,
+    ] = await Promise.all([
+      this.prisma.employeeMemo.count({ where: memoWhere }),
+      this.prisma.taskProject.count({
+        where: { ...taskWhere, status: { not: 'Closed' } },
+      }),
+      this.prisma.reimbursement.count({ where: reimbWhere }),
+      this.prisma.leaveApplication.count({ where: leaveWhere }),
+      this.prisma.salaryAdvance.count({ where: advanceWhere }),
+      this.prisma.taskProject.findMany({
+        where: {
+          ...taskWhere,
+          dueDateTime: { not: null },
+          status: { not: 'Closed' },
+        },
+        orderBy: { dueDateTime: 'asc' },
+        take: 100,
+        select: {
+          id: true,
+          taskCode: true,
+          taskName: true,
+          status: true,
+          priority: true,
+          dueDateTime: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.manageEmployee.findMany({
+        where: employeeWhere,
+        select: {
+          id: true,
+          employeeFirstName: true,
+          employeeLastName: true,
+          dateOfBirth: true,
+          joiningDate: true,
+        },
+        take: 2000,
+      }),
+      this.prisma.publicHoliday.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId
+            ? { OR: [{ branchesID: null }, { branchesID: query.branchId }] }
+            : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+        },
+        include: { manageHoliday: { select: { holidayName: true } } },
+        take: 500,
+      }),
+      query.companyID
+        ? this.prisma.company.findUnique({
+            where: { id: query.companyID },
+            select: { companyName: true },
+          })
+        : Promise.resolve(null),
+      this.prisma.leaveApplication.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+        },
+        orderBy: { id: 'desc' },
+        take: 12,
+        select: {
+          id: true,
+          appliedLeaveType: true,
+          fromDate: true,
+          toDate: true,
+          status: true,
+          purpose: true,
+          manageEmployee: {
+            select: { employeeFirstName: true, employeeLastName: true },
+          },
+        },
+      }),
+      this.prisma.employeeMemo.findMany({
+        where: { ...memoWhere, createdAt: { gte: weekAgo } },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: {
+          id: true,
+          subject: true,
+          memoType: true,
+          createdAt: true,
+          issuedBy: true,
+          manageEmployee: {
+            select: { employeeFirstName: true, employeeLastName: true },
+          },
+        },
+      }),
+      this.prisma.employeeCredentials.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+          createdAt: { gte: weekAgo },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: {
+          id: true,
+          createdAt: true,
+          employee: {
+            select: { employeeFirstName: true, employeeLastName: true, employeeID: true },
+          },
+        },
+      }),
+      this.prisma.generateSalary.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+          createdAt: { gte: weekAgo },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 40,
+        select: {
+          id: true,
+          monthPeriod: true,
+          status: true,
+          createdAt: true,
+          manageEmployee: {
+            select: { employeeFirstName: true, employeeLastName: true },
+          },
+        },
+      }),
+      this.prisma.taskProject.findMany({
+        where: { ...taskWhere, createdAt: { gte: weekAgo } },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: {
+          id: true,
+          taskCode: true,
+          taskName: true,
+          priority: true,
+          status: true,
+          createdAt: true,
+          assignments: {
+            take: 3,
+            select: {
+              manageEmployee: {
+                select: { employeeFirstName: true, employeeLastName: true },
+              },
+            },
+          },
+        },
+      }),
+      this.prisma.empAttendanceLogs.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+          createdAt: { gte: weekAgo },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 60,
+        select: {
+          id: true,
+          employeeID: true,
+          punchTimeStamp: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.attendanceLocation.findMany({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+          checkinTime: { gte: weekAgo },
+        },
+        orderBy: { checkinTime: 'desc' },
+        take: 40,
+        select: {
+          id: true,
+          employeeId: true,
+          checkType: true,
+          checkinTime: true,
+          employee: {
+            select: { employeeFirstName: true, employeeLastName: true },
+          },
+        },
+      }),
+      this.prisma.employeeCredentials.count({
+        where: {
+          ...(query.companyID ? { companyID: query.companyID } : {}),
+          ...(query.branchId ? { branchesID: query.branchId } : {}),
+          ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+          createdAt: { gte: monthStart, lt: nextMonthStart },
+          employee: {
+            isDeleted: false,
+            OR: [
+              { employmentStatus: null },
+              { employmentStatus: { not: 'Terminated' } },
+            ],
+          },
+        },
+      }),
+    ]);
+
+    const upcomingEvents = this.buildUpcomingEvents(employees, today);
+    const newsFeed = this.buildNewsFeed(employees, holidays, company?.companyName ?? 'Company', today);
+    const recentActivities = this.buildRecentActivities({
+      employees,
+      recentLeaves,
+      recentMemos,
+      recentCreatedEmployees,
+      recentPayroll,
+      recentTaskCreates,
+      recentPunches,
+      recentMobilePunches,
+    });
+
+    return {
+      pendingCounts: {
+        im: imCount,
+        tasks: taskCount,
+        reimbursement: reimbursementCount,
+        leave: leaveCount,
+        salaryAdvance: salaryAdvanceCount,
+      },
+      latestTasks,
+      upcomingEvents,
+      newsFeed,
+      recentActivities,
+      newJoinersThisMonth,
+    };
+  }
+
+  /** Employees created in the current calendar month (same rule as New Joiners KPI). */
+  async getNewJoiners(query: TodayOverviewQuery) {
+    const today = new Date();
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1, 0, 0, 0, 0);
+    const nextMonthStart = new Date(today.getFullYear(), today.getMonth() + 1, 1, 0, 0, 0, 0);
+    const monthLabel = today.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+    const rows = await this.prisma.employeeCredentials.findMany({
+      where: {
+        ...(query.companyID ? { companyID: query.companyID } : {}),
+        ...(query.branchId ? { branchesID: query.branchId } : {}),
+        ...(query.serviceProviderID ? { serviceProviderID: query.serviceProviderID } : {}),
+        createdAt: { gte: monthStart, lt: nextMonthStart },
+        employee: {
+          isDeleted: false,
+          OR: [
+            { employmentStatus: null },
+            { employmentStatus: { not: 'Terminated' } },
+          ],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        createdAt: true,
+        username: true,
+        employee: {
+          select: {
+            id: true,
+            employeeID: true,
+            employeeFirstName: true,
+            employeeLastName: true,
+            joiningDate: true,
+            businessEmail: true,
+            branches: { select: { branchName: true } },
+            departments: { select: { departmentName: true } },
+            designations: { select: { designation: true } },
+          },
+        },
+      },
+    });
+
+    return {
+      month: monthLabel,
+      monthStart: dateKeyLocal(monthStart),
+      count: rows.length,
+      employees: rows.map((r) => {
+        const emp = r.employee;
+        const name =
+          `${emp?.employeeFirstName ?? ''} ${emp?.employeeLastName ?? ''}`.trim() || 'Employee';
+        return {
+          id: emp?.id ?? r.id,
+          employeeCode: emp?.employeeID ?? null,
+          name,
+          employeeFirstName: emp?.employeeFirstName ?? '',
+          employeeLastName: emp?.employeeLastName ?? '',
+          joiningDate: emp?.joiningDate ?? null,
+          createdAt: r.createdAt,
+          username: r.username,
+          email: emp?.businessEmail ?? null,
+          branchName: emp?.branches?.branchName ?? null,
+          departmentName: emp?.departments?.departmentName ?? null,
+          designationName: emp?.designations?.designation ?? null,
+        };
+      }),
+    };
+  }
+
+  private employeeDisplayName(
+    emp?: { employeeFirstName?: string | null; employeeLastName?: string | null } | null,
+  ): string {
+    const name = `${emp?.employeeFirstName ?? ''} ${emp?.employeeLastName ?? ''}`.trim();
+    return name || 'Employee';
+  }
+
+  private formatActivityTime(at: Date): string {
+    const now = Date.now();
+    const diffMs = now - at.getTime();
+    const mins = Math.floor(diffMs / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 7) return `${days}d ago`;
+    return at.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+
+  private buildRecentActivities(input: {
+    employees: { id: number; employeeFirstName: string | null; employeeLastName: string | null }[];
+    recentLeaves: {
+      id: number;
+      appliedLeaveType: string | null;
+      fromDate: Date | null;
+      toDate: Date | null;
+      status: string | null;
+      purpose: string | null;
+      manageEmployee: { employeeFirstName: string | null; employeeLastName: string | null } | null;
+    }[];
+    recentMemos: {
+      id: number;
+      subject: string | null;
+      memoType: string | null;
+      createdAt: Date;
+      issuedBy: string | null;
+      manageEmployee: { employeeFirstName: string | null; employeeLastName: string | null } | null;
+    }[];
+    recentCreatedEmployees: {
+      id: number;
+      createdAt: Date;
+      employee: {
+        employeeFirstName: string | null;
+        employeeLastName: string | null;
+        employeeID: string | null;
+      } | null;
+    }[];
+    recentPayroll: {
+      id: number;
+      monthPeriod: string;
+      status: string | null;
+      createdAt: Date;
+      manageEmployee: { employeeFirstName: string | null; employeeLastName: string | null } | null;
+    }[];
+    recentTaskCreates: {
+      id: number;
+      taskCode: string;
+      taskName: string;
+      priority: string;
+      status: string;
+      createdAt: Date;
+      assignments: {
+        manageEmployee: { employeeFirstName: string | null; employeeLastName: string | null } | null;
+      }[];
+    }[];
+    recentPunches: {
+      id: number;
+      employeeID: number | null;
+      punchTimeStamp: string;
+      createdAt: Date;
+    }[];
+    recentMobilePunches: {
+      id: number;
+      employeeId: number;
+      checkType: string;
+      checkinTime: Date;
+      employee: { employeeFirstName: string | null; employeeLastName: string | null } | null;
+    }[];
+  }) {
+    type Activity = {
+      id: string;
+      kind: string;
+      headline: string;
+      body: string;
+      time: string;
+      sortAt: number;
+      href: string;
+      avatarInitial: string;
+    };
+    const items: Activity[] = [];
+    const empById = new Map(input.employees.map((e) => [e.id, e]));
+    const weekAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    for (const row of input.recentCreatedEmployees) {
+      const name = this.employeeDisplayName(row.employee);
+      items.push({
+        id: `emp-created-${row.id}`,
+        kind: 'employee',
+        headline: `${name} was created`,
+        body: row.employee?.employeeID
+          ? `Employee ID ${row.employee.employeeID} added to the company`
+          : 'New employee record created',
+        time: this.formatActivityTime(row.createdAt),
+        sortAt: row.createdAt.getTime(),
+        href: '/manage-employees',
+        avatarInitial: name.charAt(0).toUpperCase() || 'E',
+      });
+    }
+
+    for (const leave of input.recentLeaves) {
+      const fromTs = leave.fromDate?.getTime();
+      if (fromTs == null || fromTs < weekAgoMs) continue;
+      if (fromTs > Date.now()) continue; // upcoming leave dates aren't "past week" activity
+
+      const name = this.employeeDisplayName(leave.manageEmployee);
+      const leaveType = (leave.appliedLeaveType || 'leave').replace(/_/g, ' ');
+      const from = leave.fromDate
+        ? leave.fromDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+        : null;
+      const to = leave.toDate
+        ? leave.toDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+        : null;
+      const range = from && to ? (from === to ? from : `${from} – ${to}`) : from || to || 'upcoming dates';
+      items.push({
+        id: `leave-${leave.id}`,
+        kind: 'leave',
+        headline: `${name} applied ${leaveType}`,
+        body: `For ${range}${leave.status ? ` · ${leave.status}` : ''}`,
+        time: this.formatActivityTime(leave.fromDate!),
+        sortAt: fromTs,
+        href: '/leave-applications',
+        avatarInitial: name.charAt(0).toUpperCase() || 'L',
+      });
+    }
+
+    for (const memo of input.recentMemos) {
+      const toName = this.employeeDisplayName(memo.manageEmployee);
+      const sender = memo.issuedBy?.trim() || 'Someone';
+      items.push({
+        id: `memo-${memo.id}`,
+        kind: 'memo',
+        headline: `${sender} sent an internal message`,
+        body: memo.subject
+          ? `“${memo.subject}”${memo.manageEmployee ? ` to ${toName}` : ''}`
+          : memo.manageEmployee
+            ? `Message to ${toName}`
+            : memo.memoType || 'Internal message',
+        time: this.formatActivityTime(memo.createdAt),
+        sortAt: memo.createdAt.getTime(),
+        href: '/employee-memo',
+        avatarInitial: sender.charAt(0).toUpperCase() || 'M',
+      });
+    }
+
+    // Group payroll rows by monthPeriod + day so one run shows as one activity
+    const payrollGroups = new Map<string, typeof input.recentPayroll>();
+    for (const row of input.recentPayroll) {
+      const dayKey = dateKeyLocal(row.createdAt);
+      const key = `${row.monthPeriod}|${dayKey}`;
+      const list = payrollGroups.get(key) ?? [];
+      list.push(row);
+      payrollGroups.set(key, list);
+    }
+    for (const [key, rows] of payrollGroups) {
+      const first = rows[0];
+      if (!first) continue;
+      items.push({
+        id: `payroll-${key}`,
+        kind: 'payroll',
+        headline: 'Payroll generated',
+        body:
+          rows.length > 1
+            ? `${rows.length} salary slips for ${first.monthPeriod}`
+            : `${this.employeeDisplayName(first.manageEmployee)} · ${first.monthPeriod}`,
+        time: this.formatActivityTime(first.createdAt),
+        sortAt: first.createdAt.getTime(),
+        href: '/generate-salary',
+        avatarInitial: 'P',
+      });
+    }
+
+    for (const task of input.recentTaskCreates) {
+      const assignees = task.assignments
+        .map((a) => this.employeeDisplayName(a.manageEmployee))
+        .filter(Boolean);
+      items.push({
+        id: `task-created-${task.id}`,
+        kind: 'task',
+        headline: assignees.length
+          ? `New task assigned to ${assignees.slice(0, 2).join(', ')}`
+          : `New task created: ${task.taskName}`,
+        body: `${task.taskCode} — ${task.taskName} · ${task.priority}`,
+        time: this.formatActivityTime(task.createdAt),
+        sortAt: task.createdAt.getTime(),
+        href: '/task-projects',
+        avatarInitial: 'T',
+      });
+    }
+
+    // Collapse punches per employee per day into check-in / check-out events
+    const punchesByEmpDay = new Map<string, typeof input.recentPunches>();
+    for (const punch of input.recentPunches) {
+      if (!punch.employeeID) continue;
+      const day = punch.punchTimeStamp.split(' ')[0] || dateKeyLocal(punch.createdAt);
+      const key = `${punch.employeeID}|${day}`;
+      const list = punchesByEmpDay.get(key) ?? [];
+      list.push(punch);
+      punchesByEmpDay.set(key, list);
+    }
+    for (const [key, punches] of punchesByEmpDay) {
+      const empId = Number(key.split('|')[0]);
+      const sorted = [...punches].sort(
+        (a, b) => new Date(a.punchTimeStamp).getTime() - new Date(b.punchTimeStamp).getTime(),
+      );
+      const emp = empById.get(empId);
+      const name = this.employeeDisplayName(emp);
+      const first = sorted[0];
+      const last = sorted[sorted.length - 1];
+      if (!first) continue;
+
+      const firstTime =
+        first.punchTimeStamp.split(' ')[1]?.slice(0, 5) ||
+        this.formatActivityTime(first.createdAt);
+      items.push({
+        id: `punch-in-${key}-${first.id}`,
+        kind: 'attendance',
+        headline: `${name} checked in`,
+        body: `Checked in at ${firstTime}`,
+        time: this.formatActivityTime(first.createdAt),
+        sortAt: first.createdAt.getTime(),
+        href: '/attendance-logs',
+        avatarInitial: name.charAt(0).toUpperCase() || 'A',
+      });
+
+      if (sorted.length > 1 && last && last.id !== first.id) {
+        const lastTime =
+          last.punchTimeStamp.split(' ')[1]?.slice(0, 5) ||
+          this.formatActivityTime(last.createdAt);
+        items.push({
+          id: `punch-out-${key}-${last.id}`,
+          kind: 'attendance',
+          headline: `${name} checked out`,
+          body: `Checked out at ${lastTime}`,
+          time: this.formatActivityTime(last.createdAt),
+          sortAt: last.createdAt.getTime(),
+          href: '/attendance-logs',
+          avatarInitial: name.charAt(0).toUpperCase() || 'A',
+        });
+      }
+    }
+
+    for (const punch of input.recentMobilePunches) {
+      const name = this.employeeDisplayName(punch.employee);
+      const type = (punch.checkType || '').toUpperCase();
+      const isOut = type.includes('OUT') || type.includes('CHECKOUT') || type === 'OUT';
+      const clock = punch.checkinTime.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+      items.push({
+        id: `mobile-punch-${punch.id}`,
+        kind: 'attendance',
+        headline: isOut ? `${name} checked out` : `${name} checked in`,
+        body: `${isOut ? 'Checked out' : 'Checked in'} at ${clock}`,
+        time: this.formatActivityTime(punch.checkinTime),
+        sortAt: punch.checkinTime.getTime(),
+        href: '/attendance-logs',
+        avatarInitial: name.charAt(0).toUpperCase() || 'A',
+      });
+    }
+
+    items.sort((a, b) => b.sortAt - a.sortAt);
+    return items
+      .filter((item) => item.sortAt >= weekAgoMs)
+      .slice(0, 20)
+      .map(({ sortAt: _s, ...rest }) => rest);
+  }
+
+  private parseMonthDay(value: string | null | undefined): { month: number; day: number } | null {
+    if (!value) return null;
+    const s = String(value).trim();
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return { month: Number(iso[2]), day: Number(iso[3]) };
+    const slash = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
+    if (slash) return { month: Number(slash[2]), day: Number(slash[1]) };
+    return null;
+  }
+
+  /** Full calendar date (year included) — used for onboarding news, not anniversaries. */
+  private parseFullDate(value: string | null | undefined): Date | null {
+    if (!value) return null;
+    const s = String(value).trim();
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) {
+      return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]), 12, 0, 0, 0);
+    }
+    const slash = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (slash) {
+      return new Date(Number(slash[3]), Number(slash[2]) - 1, Number(slash[1]), 12, 0, 0, 0);
+    }
+    return null;
+  }
+
+  private daysFromToday(today: Date, target: Date): number {
+    const a = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 12, 0, 0, 0);
+    const b = new Date(target.getFullYear(), target.getMonth(), target.getDate(), 12, 0, 0, 0);
+    return Math.round((b.getTime() - a.getTime()) / 86400000);
+  }
+
+  private formatRelativeWhen(diff: number): string {
+    if (diff === -1) return 'Yesterday';
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Tomorrow';
+    if (diff < 0) return `${Math.abs(diff)} days ago`;
+    return `In ${diff} days`;
+  }
+
+  private buildUpcomingEvents(
+    employees: {
+      id: number;
+      employeeFirstName: string | null;
+      employeeLastName: string | null;
+      dateOfBirth: string | null;
+      joiningDate: string | null;
+    }[],
+    today: Date,
+  ) {
+    const events: { id: string; kind: 'birthday' | 'anniversary'; label: string; date: string; when: string }[] = [];
+
+    for (const emp of employees) {
+      const name =
+        `${emp.employeeFirstName ?? ''} ${emp.employeeLastName ?? ''}`.trim() || 'Employee';
+
+      const dob = this.parseMonthDay(emp.dateOfBirth);
+      if (dob) {
+        // Current + next year so calendar month views can mark days year-round
+        for (const yearOffset of [0, 1]) {
+          const eventAt = new Date(
+            today.getFullYear() + yearOffset,
+            dob.month - 1,
+            dob.day,
+            12,
+            0,
+            0,
+            0,
+          );
+        const diff = this.daysFromToday(today, eventAt);
+          if (diff < -60 || diff > 400) continue;
+          events.push({
+            id: `bday-${emp.id}-y${yearOffset}`,
+            kind: 'birthday',
+            label: `${name}'s birthday`,
+            date: dateKeyLocal(eventAt),
+            when: this.formatRelativeWhen(diff),
+          });
+        }
+      }
+
+      const join = this.parseMonthDay(emp.joiningDate);
+      if (join) {
+        for (const yearOffset of [0, 1]) {
+          const eventAt = new Date(
+            today.getFullYear() + yearOffset,
+            join.month - 1,
+            join.day,
+            12,
+            0,
+            0,
+            0,
+          );
+        const diff = this.daysFromToday(today, eventAt);
+          if (diff < -60 || diff > 400) continue;
+          const joinYear = Number(String(emp.joiningDate).slice(0, 4)) || today.getFullYear();
+          const years = today.getFullYear() + yearOffset - joinYear;
+          events.push({
+            id: `anniv-${emp.id}-y${yearOffset}`,
+            kind: 'anniversary',
+            label: years > 0 ? `${name} — ${years} yr work anniversary` : `${name} joined the company`,
+            date: dateKeyLocal(eventAt),
+            when: this.formatRelativeWhen(diff),
+          });
+        }
+      }
+    }
+
+    events.sort((a, b) => a.date.localeCompare(b.date));
+    return events;
+  }
+
+  private buildNewsFeed(
+    employees: {
+      id: number;
+      employeeFirstName: string | null;
+      employeeLastName: string | null;
+      joiningDate: string | null;
+    }[],
+    holidays: {
+      id: number;
+      startDate: Date | null;
+      manageHoliday: { holidayName: string | null } | null;
+    }[],
+    companyName: string,
+    today: Date,
+  ) {
+    const items: { id: string; kind: 'onboarding' | 'holiday'; title: string; subtitle: string; date: string }[] = [];
+
+    for (const emp of employees) {
+      const joinDate = this.parseFullDate(emp.joiningDate);
+      if (!joinDate) continue;
+      const diff = this.daysFromToday(today, joinDate);
+      // Only actual new joinings (full date), not yearly work anniversaries.
+      if (diff === -1 || diff === 0 || diff === 1) {
+        const name =
+          `${emp.employeeFirstName ?? ''} ${emp.employeeLastName ?? ''}`.trim() || 'New employee';
+        const title =
+          diff === 0
+            ? `${name} onboarded today`
+            : diff === 1
+              ? `${name} joins tomorrow`
+              : `${name} onboarded yesterday`;
+        items.push({
+          id: `onboard-${emp.id}-${dateKeyLocal(joinDate)}`,
+          kind: 'onboarding',
+          title,
+          subtitle: `Welcome to ${companyName}`,
+          date: dateKeyLocal(joinDate),
+        });
+      }
+    }
+
+    for (const h of holidays) {
+      if (!h.startDate) continue;
+      const eventAt = new Date(h.startDate);
+      const diff = this.daysFromToday(today, eventAt);
+      // Broad window so dashboard calendar can show public holidays for the month
+      if (diff < -60 || diff > 400) continue;
+        const holidayName = h.manageHoliday?.holidayName?.trim() || 'Public holiday';
+      const title =
+        diff === 0
+          ? `${holidayName} today`
+          : diff === 1
+            ? `${holidayName} tomorrow`
+            : holidayName;
+        items.push({
+          id: `holiday-${h.id}`,
+          kind: 'holiday',
+        title,
+          subtitle: companyName,
+          date: dateKeyLocal(eventAt),
+        });
+    }
+
+    items.sort((a, b) => a.date.localeCompare(b.date));
+    return items;
+  }
+
+  async getCompanyMonthBoard(query: TodayOverviewQuery) {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const employees = await this.prisma.manageEmployee.findMany({
+      where: {
+        isDeleted: false,
+        ...(query.companyID ? { companyID: query.companyID } : {}),
+        ...(query.branchId ? { branchesID: query.branchId } : {}),
+      },
+      select: {
+        id: true,
+        employeeFirstName: true,
+        employeeLastName: true,
+        joiningDate: true,
+        dateOfBirth: true,
+        exitDate: true,
+      },
+    });
+    const nameOf = (emp: { employeeFirstName: string | null; employeeLastName: string | null }) =>
+      `${emp.employeeFirstName || ''} ${emp.employeeLastName || ''}`.trim() || 'Employee';
+    const events: Array<{ date: string; kind: string; label: string }> = [];
+    for (const emp of employees) {
+      const name = nameOf(emp);
+      const joining = String(emp.joiningDate || '').slice(0, 10);
+      if (joining.startsWith(monthKey)) events.push({ date: joining, kind: 'joiner', label: `${name} joined` });
+      const exit = emp.exitDate ? dateKeyLocal(new Date(emp.exitDate)) : '';
+      if (exit.startsWith(monthKey)) events.push({ date: exit, kind: 'leaver', label: `${name} left` });
+      const dob = this.parseMonthDay(emp.dateOfBirth);
+      if (dob && dob.month === now.getMonth() + 1) {
+        const date = `${monthKey}-${String(dob.day).padStart(2, '0')}`;
+        events.push({ date, kind: 'birthday', label: `${name}'s birthday` });
+      }
+    }
+    const leaves = await this.prisma.leaveApplication.findMany({
+      where: {
+        ...(query.companyID ? { companyID: query.companyID } : {}),
+        ...(query.branchId ? { branchesID: query.branchId } : {}),
+        status: { in: ['Approved', 'APPROVED'] },
+        fromDate: { lte: monthEnd },
+        toDate: { gte: monthStart },
+      },
+      select: {
+        fromDate: true,
+        toDate: true,
+        manageEmployee: { select: { employeeFirstName: true, employeeLastName: true } },
+      },
+    });
+    for (const leave of leaves) {
+      if (!leave.fromDate || !leave.toDate) continue;
+      const name = nameOf(leave.manageEmployee || { employeeFirstName: null, employeeLastName: null });
+      const cursor = new Date(leave.fromDate);
+      const last = new Date(leave.toDate);
+      while (cursor <= last) {
+        const date = dateKeyLocal(cursor);
+        if (date.startsWith(monthKey)) events.push({ date, kind: 'leave', label: `${name} on leave` });
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+    const employeeIds = employees.map((emp) => emp.id);
+    const punches = employeeIds.length
+      ? await this.prisma.process_att_logs.findMany({
+          where: {
+            manage_employee_id: { in: employeeIds },
+            punch_time: { gte: monthStart, lte: monthEnd },
+          },
+          select: { manage_employee_id: true, punch_time: true },
+        })
+      : [];
+    const byDay = new Map<string, Set<number>>();
+    for (const punch of punches) {
+      if (!punch.punch_time || !punch.manage_employee_id) continue;
+      const date = dateKeyLocal(new Date(punch.punch_time));
+      if (!date.startsWith(monthKey)) continue;
+      const set = byDay.get(date) || new Set<number>();
+      set.add(punch.manage_employee_id);
+      byDay.set(date, set);
+    }
+    const daysInMonth = monthEnd.getDate();
+    const trend = Array.from({ length: daysInMonth }, (_, index) => {
+      const date = `${monthKey}-${String(index + 1).padStart(2, '0')}`;
+      return { date, present: byDay.get(date)?.size || 0 };
+    });
+    return { events, trend, headcount: employees.length };
+  }
+
+  emptyTodayOverview(query: TodayOverviewQuery) {
+    return this.emptyResponse(dateKeyLocal(new Date()), query);
+  }
+
+  emptyNewJoiners() {
+    const today = new Date();
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1, 0, 0, 0, 0);
+    return {
+      month: today.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+      monthStart: dateKeyLocal(monthStart),
+      count: 0,
+      employees: [],
+    };
+  }
+
+  private emptyResponse(date: string, query: TodayOverviewQuery) {
+    const yesterdayDate = new Date(`${date}T12:00:00`);
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    return {
+      date,
+      filters: {
+        companyID: query.companyID ?? null,
+        branchId: query.branchId ?? null,
+        departmentId: query.departmentId ?? null,
+      },
+      summary: {
+        total: 0,
+        present: 0,
+        absent: 0,
+        lateMark: 0,
+        halfDay: 0,
+        noCheckout: 0,
+        onLeave: 0,
+        weekOff: 0,
+        holiday: 0,
+        ot: 0,
+        regularized: 0,
+      },
+      statusCounts: {},
+      employees: [],
+      yesterday: dateKeyLocal(yesterdayDate),
+      yesterdayMissingCheckout: [],
+    };
+  }
+}

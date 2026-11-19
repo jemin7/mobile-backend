@@ -1,0 +1,607 @@
+"use client";
+
+import { useEffect, useId, useMemo, useState, type CSSProperties } from "react";
+
+function clamp01(v: number) {
+  return Math.min(1, Math.max(0, v));
+}
+
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
+}
+
+type WeatherScene = {
+  /** Full-card horizontal wash — left always stays white */
+  cardGradient: string;
+  /** Soft radial sky tint on the right (no hard box) */
+  rightAtmosphere: string;
+  sunGlow: string;
+  sunTop: number;
+  sunRight: number;
+  sunOpacity: number;
+  sunClipBottom: number;
+  sunClipTop: number;
+  moonTop: number;
+  moonRight: number;
+  moonOpacity: number;
+  moonClipTop: number;
+  moonClipBottom: number;
+  cloudTop: number;
+  cloudRight: number;
+  cloudOpacity: number;
+  cloudNight: boolean;
+  cloudDrift: number;
+  starsOpacity: number;
+  farCloudsOpacity: number;
+  showSun: boolean;
+  showMoon: boolean;
+};
+
+/** Shared cloud hub — sits under the sun/moon cut edge (higher % = lower on screen) */
+const CLOUD_HUB_TOP = 72;
+const CLOUD_HUB_RIGHT = 6;
+/** Moon sits slightly left of the cloud anchor */
+const MOON_HUB_RIGHT = 12;
+/** Celestial peek position — centred on cloud so the lower disc hides behind it */
+const CELESTIAL_RISE_START = 42;
+/** Highest point in the sky (lower % = higher on screen) */
+const CELESTIAL_APEX_TOP = 8;
+/** Celestial position when sinking back toward the cloud */
+const CELESTIAL_SET_END = 48;
+/**
+ * Approx celestial box height as % of the hero stage (128px sun in ~210px card).
+ * Used to place the cloud on the flat cut, not across the disc middle.
+ */
+const CELESTIAL_HEIGHT_PCT = 60;
+
+/**
+ * Hub cloud opacity from celestial height:
+ * fully risen (near apex) → soft but still covering the cut;
+ * near the horizon/cloud hub (setting or rising) → fully visible.
+ */
+function cloudOpacityFromCelestialTop(celestialTop: number) {
+  const span = Math.max(1, CELESTIAL_SET_END - CELESTIAL_APEX_TOP);
+  const nearHorizon = clamp01((celestialTop - CELESTIAL_APEX_TOP) / span);
+  // Keep a visible cloud even near apex so the cut line never sits bare.
+  const t = Math.pow(nearHorizon, 0.35);
+  return lerp(0.55, 1, t);
+}
+
+/** When the disc is clipped, force a visible cloud so the cut never looks bare. */
+function cloudOpacityForClip(baseOpacity: number, clipBottom: number) {
+  if (clipBottom <= 2) return baseOpacity;
+  const cover = lerp(0.6, 1, clamp01(clipBottom / 52));
+  return Math.max(baseOpacity, cover);
+}
+
+/**
+ * Clip only a thin lower band of the disc so the upper sun/moon stays fully round.
+ * Near the hub → clip more; at apex → still a small rim behind the cloud.
+ */
+function celestialClipBottom(celestialTop: number) {
+  const span = Math.max(1, CELESTIAL_SET_END - CELESTIAL_APEX_TOP);
+  const nearCloud = clamp01((celestialTop - CELESTIAL_APEX_TOP) / span);
+  // Always keep a slim cut for the cloud to cover; never carve through mid-disc.
+  return Math.round(lerp(12, 30, Math.pow(nearCloud, 0.85)));
+}
+
+/** Place cloud so its body sits on the flat cut; upper disc stays clear. */
+function cloudTopForCut(celestialTop: number, clipBottom: number) {
+  const cutLine = celestialTop + CELESTIAL_HEIGHT_PCT * (1 - clipBottom / 100);
+  // Nudge slightly above the cut so the fluffy top masks the edge (not the disc center).
+  return Math.min(84, Math.max(64, cutLine - 4));
+}
+
+/** Night palette — deeper navy, still feathered (not a hard box) */
+const NIGHT_CORE: [number, number, number] = [24, 36, 68];
+const NIGHT_DEEP: [number, number, number] = [35, 52, 92];
+const NIGHT_MID: [number, number, number] = [58, 78, 118];
+const NIGHT_EDGE: [number, number, number] = [98, 118, 158];
+
+function rgba(c: [number, number, number], a: number) {
+  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a})`;
+}
+
+function getWeatherScene(date: Date): WeatherScene {
+  const t = date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+
+  const white: [number, number, number] = [255, 255, 255];
+  const lightBlue: [number, number, number] = [186, 214, 244];
+  const skyBlue: [number, number, number] = [135, 185, 235];
+  const warmGold: [number, number, number] = [255, 228, 180];
+  const sunsetOrange: [number, number, number] = [255, 168, 110];
+  const sunsetPink: [number, number, number] = [232, 140, 168];
+  const sunsetPurple: [number, number, number] = [120, 100, 168];
+  const sunrisePurple: [number, number, number] = [100, 88, 148];
+  const sunrisePink: [number, number, number] = [240, 160, 175];
+  const sunriseOrange: [number, number, number] = [255, 175, 120];
+
+  let cardGradient =
+    "linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 44%, #FFFDF8 58%, #FFF8EB 76%, #FFF4DD 92%, #FFF0D7 100%)";
+  let rightAtmosphere =
+    "radial-gradient(ellipse 52% 90% at 96% 38%, rgba(186,214,244,0.28) 0%, rgba(255,228,180,0.12) 32%, transparent 68%)";
+  let sunGlow = "rgba(255, 211, 77, 0.18)";
+
+  let sunTop = 28;
+  let sunRight = 14;
+  let sunOpacity = 0;
+  let sunClipBottom = 0;
+  let sunClipTop = 100;
+  let moonTop = 26;
+  let moonRight = MOON_HUB_RIGHT;
+  let moonOpacity = 0;
+  let moonClipTop = 100;
+  let moonClipBottom = 0;
+  let cloudTop = CLOUD_HUB_TOP;
+  let cloudRight = CLOUD_HUB_RIGHT;
+  let cloudOpacity = 0.95;
+  let cloudNight = false;
+  let cloudDrift = 0;
+  let starsOpacity = 0;
+  let farCloudsOpacity = 0.55;
+  let showSun = false;
+  let showMoon = false;
+
+  // Sunrise 5:00 – 6:00 — sun rises from cloud, moon finishes setting into cloud
+  if (t >= 5 && t < 6) {
+    const p = (t - 5) / 1;
+    cardGradient = `linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 46%, #FAF8FC 60%, #F8F0F4 76%, #FFF4E8 90%, #FFF0DC 100%)`;
+    rightAtmosphere = `radial-gradient(ellipse 50% 88% at 96% 36%, ${rgba(sunrisePurple, lerp(0.14, 0.06, p))} 0%, ${rgba(sunrisePink, lerp(0.1, 0.04, p))} 30%, transparent 66%)`;
+    sunGlow = `rgba(255, 200, 120, ${lerp(0.06, 0.18, p)})`;
+
+    cloudTop = CLOUD_HUB_TOP;
+    cloudRight = CLOUD_HUB_RIGHT;
+
+    // Sun rises upward through the cloud hub
+    const sunRise = clamp01((p - 0.02) / 0.98);
+    sunTop = lerp(CELESTIAL_RISE_START, CELESTIAL_APEX_TOP, sunRise);
+    sunRight = CLOUD_HUB_RIGHT;
+    sunOpacity = clamp01((sunRise - 0.04) / 0.96);
+    sunClipTop = 0;
+    sunClipBottom = celestialClipBottom(sunTop);
+    showSun = sunOpacity > 0.02;
+
+    // Moon sinks down into the cloud hub
+    const moonSet = clamp01(p * 1.1);
+    moonTop = lerp(CELESTIAL_APEX_TOP, CELESTIAL_SET_END, moonSet);
+    moonRight = MOON_HUB_RIGHT;
+    moonOpacity = clamp01(1 - moonSet * 1.1);
+    moonClipTop = 0;
+    moonClipBottom = celestialClipBottom(moonTop);
+    showMoon = moonOpacity > 0.02;
+
+    cloudOpacity = cloudOpacityForClip(
+      cloudOpacityFromCelestialTop(
+        Math.min(showSun ? sunTop : 999, showMoon ? moonTop : 999),
+      ),
+      Math.max(sunClipBottom, moonClipBottom),
+    );
+    farCloudsOpacity = lerp(0, 0.45, p);
+    starsOpacity = clamp01(1 - p * 1.15) * 0.35;
+  }
+  // Day 6:00 – 16:00 — sun travels above the cloud hub
+  else if (t >= 6 && t < 16) {
+    const p = (t - 6) / 10;
+    const noonFactor = 1 - Math.abs(p - 0.5) * 2;
+
+    cardGradient = `linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 44%, #FFFDF8 56%, #FFF8EB 72%, #FFF4DD 88%, #FFF0D7 100%)`;
+    rightAtmosphere = `radial-gradient(ellipse 52% 92% at 96% 36%, ${rgba(lightBlue, lerp(0.22, 0.32, noonFactor))} 0%, ${rgba(skyBlue, lerp(0.1, 0.16, noonFactor))} 28%, ${rgba(warmGold, 0.08)} 48%, transparent 68%)`;
+    sunGlow = `rgba(255, 211, 77, ${lerp(0.12, 0.22, noonFactor)})`;
+
+    cloudTop = CLOUD_HUB_TOP;
+    cloudRight = CLOUD_HUB_RIGHT;
+
+    sunTop = lerp(CELESTIAL_APEX_TOP + 4, CELESTIAL_APEX_TOP, noonFactor) + lerp(0, 2, p);
+    sunRight = CLOUD_HUB_RIGHT;
+    sunOpacity = 1;
+    sunClipTop = 0;
+    sunClipBottom = celestialClipBottom(sunTop);
+    showSun = true;
+
+    cloudOpacity = cloudOpacityForClip(cloudOpacityFromCelestialTop(sunTop), sunClipBottom);
+    farCloudsOpacity = 0.35 + noonFactor * 0.2;
+    cloudDrift = p * 10;
+  }
+  // Sunset 16:00 – 18:00 — sun descends into the cloud hub
+  else if (t >= 16 && t < 18) {
+    const p = (t - 16) / 2;
+
+    cardGradient = `linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 44%, #FFFDF9 56%, #FFF6ED 72%, #FFF1E4 88%, #FFEBD8 100%)`;
+    rightAtmosphere = `radial-gradient(ellipse 50% 90% at 96% 38%, ${rgba(sunsetPurple, lerp(0.08, 0.14, p))} 0%, ${rgba(sunsetPink, lerp(0.06, 0.12, p))} 26%, ${rgba(sunsetOrange, lerp(0.05, 0.1, p))} 44%, transparent 66%)`;
+    sunGlow = `rgba(255, 170, 90, ${lerp(0.18, 0.08, p)})`;
+
+    cloudTop = CLOUD_HUB_TOP;
+    cloudRight = CLOUD_HUB_RIGHT;
+
+    const sunSet = clamp01((p - 0.15) / 0.85);
+    sunTop = lerp(CELESTIAL_APEX_TOP, CELESTIAL_SET_END, sunSet);
+    sunRight = CLOUD_HUB_RIGHT;
+    sunOpacity = lerp(1, 0.08, clamp01((p - 0.72) / 0.28));
+    sunClipTop = 0;
+    sunClipBottom = celestialClipBottom(sunTop);
+    showSun = sunOpacity > 0.04;
+
+    cloudOpacity = cloudOpacityForClip(cloudOpacityFromCelestialTop(sunTop), sunClipBottom);
+    farCloudsOpacity = lerp(0.45, 0.2, p);
+  }
+  // Evening 18:00 – 20:00 — moon rises slowly upward from the cloud hub
+  else if (t >= 18 && t < 20) {
+    const p = (t - 18) / 2;
+
+    cardGradient = `linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 48%, #F6F8FB 62%, #E8EDF4 76%, #D8E0EC 90%, #CCD6E4 100%)`;
+    rightAtmosphere = `radial-gradient(ellipse 140% 180% at 84% 50%, ${rgba(NIGHT_DEEP, lerp(0.18, 0.32, p))} 0%, ${rgba(NIGHT_MID, lerp(0.12, 0.22, p))} 32%, ${rgba(NIGHT_EDGE, lerp(0.08, 0.14, p))} 55%, transparent 82%)`;
+    sunGlow = `rgba(190, 205, 235, ${lerp(0.08, 0.16, p)})`;
+
+    sunOpacity = 0;
+    showSun = false;
+
+    cloudTop = CLOUD_HUB_TOP;
+    cloudRight = CLOUD_HUB_RIGHT;
+
+    const moonRise = clamp01((p - 0.02) / 0.95);
+    moonTop = lerp(CELESTIAL_RISE_START, CELESTIAL_APEX_TOP, moonRise);
+    moonRight = MOON_HUB_RIGHT;
+    moonOpacity = lerp(0.12, 1, moonRise);
+    moonClipTop = 0;
+    moonClipBottom = celestialClipBottom(moonTop);
+    showMoon = moonOpacity > 0.04;
+
+    cloudOpacity = cloudOpacityForClip(cloudOpacityFromCelestialTop(moonTop), moonClipBottom);
+    cloudNight = p > 0.35;
+    starsOpacity = lerp(0, 0.65, moonRise);
+    farCloudsOpacity = lerp(0.15, 0, p);
+  }
+  // Night 20:00 – 5:00 — moon above cloud, then sets into cloud before dawn
+  else {
+    const nightT = t >= 20 ? t : t + 24;
+    const nightStart = 20;
+    const nightEnd = 29;
+    const p = clamp01((nightT - nightStart) / (nightEnd - nightStart));
+
+    cardGradient = `linear-gradient(105deg, #FFFFFF 0%, #FFFFFF 48%, #F4F6FA 62%, #E2E8F2 76%, #CED8E8 90%, #B8C6DA 100%)`;
+    rightAtmosphere = `radial-gradient(ellipse 150% 200% at 82% 50%, ${rgba(NIGHT_CORE, lerp(0.34, 0.44, p))} 0%, ${rgba(NIGHT_DEEP, lerp(0.24, 0.32, p))} 28%, ${rgba(NIGHT_MID, lerp(0.14, 0.2, p))} 50%, ${rgba(NIGHT_EDGE, lerp(0.08, 0.12, p))} 68%, transparent 88%), radial-gradient(ellipse 110% 120% at 78% 72%, ${rgba(NIGHT_DEEP, lerp(0.14, 0.2, p))} 0%, transparent 72%)`;
+    sunGlow = `rgba(170, 188, 230, ${lerp(0.12, 0.2, p)})`;
+
+    cloudTop = CLOUD_HUB_TOP;
+    cloudRight = CLOUD_HUB_RIGHT;
+
+    const moonSet = clamp01((nightT - 28) / 1);
+    if (moonSet > 0) {
+      // 4:00–5:00 — moon sinks down into the cloud hub
+      moonTop = lerp(CELESTIAL_APEX_TOP, CELESTIAL_SET_END, moonSet);
+      moonRight = MOON_HUB_RIGHT;
+      moonOpacity = lerp(1, 0.06, moonSet);
+      moonClipTop = 0;
+      moonClipBottom = celestialClipBottom(moonTop);
+      showMoon = moonOpacity > 0.04;
+      starsOpacity = lerp(0.55, 0.2, moonSet);
+      cloudOpacity = cloudOpacityForClip(cloudOpacityFromCelestialTop(moonTop), moonClipBottom);
+    } else {
+      const moonFull = clamp01((nightT - 20) / 1.5);
+      moonTop = lerp(CELESTIAL_APEX_TOP + 4, CELESTIAL_APEX_TOP, moonFull);
+      moonRight = MOON_HUB_RIGHT;
+      moonOpacity = lerp(0.9, 1, moonFull);
+      moonClipTop = 0;
+      moonClipBottom = celestialClipBottom(moonTop);
+      showMoon = true;
+
+      cloudOpacity = cloudOpacityForClip(cloudOpacityFromCelestialTop(moonTop), moonClipBottom);
+      starsOpacity = lerp(0.35, 0.95, clamp01((moonFull - 0.75) / 0.25));
+    }
+
+    cloudNight = true;
+    cloudDrift = 6 + p * 6;
+    farCloudsOpacity = 0;
+  }
+
+  // Cloud removed — keep a full round sun/moon disc (no hub cut / no cover cloud).
+  cloudOpacity = 0;
+  sunClipBottom = 0;
+  moonClipBottom = 0;
+
+  return {
+    cardGradient,
+    rightAtmosphere,
+    sunGlow,
+    sunTop,
+    sunRight,
+    sunOpacity,
+    sunClipBottom,
+    sunClipTop,
+    moonTop,
+    moonRight,
+    moonOpacity,
+    moonClipTop,
+    moonClipBottom,
+    cloudTop,
+    cloudRight,
+    cloudOpacity,
+    cloudNight,
+    cloudDrift,
+    starsOpacity,
+    farCloudsOpacity,
+    showSun,
+    showMoon,
+  };
+}
+
+const STAR_POSITIONS = [
+  [8, 6], [22, 12], [38, 5], [52, 16], [68, 8], [84, 18], [14, 22], [30, 28],
+  [46, 20], [62, 26], [78, 14], [18, 38], [42, 34], [58, 40], [74, 32], [88, 44],
+  [10, 48], [34, 52], [54, 46], [72, 54], [26, 10], [60, 6], [80, 36], [44, 52],
+];
+
+function HeroSun({ uid, className }: { uid: string; className?: string }) {
+  const glowId = `sun-glow-${uid}`;
+  const bodyId = `sun-body-${uid}`;
+  const bloomId = `sun-bloom-${uid}`;
+
+  return (
+    <svg className={className} viewBox="0 0 140 140" fill="none" aria-hidden>
+      <defs>
+        <radialGradient id={bloomId} cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#FFE566" stopOpacity="0.35" />
+          <stop offset="40%" stopColor="#FFD34D" stopOpacity="0.12" />
+          <stop offset="100%" stopColor="#FFD34D" stopOpacity="0" />
+        </radialGradient>
+        <radialGradient id={glowId} cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#FFD34D" stopOpacity="0.28" />
+          <stop offset="55%" stopColor="#FFD34D" stopOpacity="0.08" />
+          <stop offset="100%" stopColor="#FFD34D" stopOpacity="0" />
+        </radialGradient>
+        <radialGradient id={bodyId} cx="38%" cy="32%" r="65%">
+          <stop offset="0%" stopColor="#FFF0A8" />
+          <stop offset="35%" stopColor="#FFE082" />
+          <stop offset="70%" stopColor="#FFD34D" />
+          <stop offset="100%" stopColor="#F0A820" />
+        </radialGradient>
+      </defs>
+      <circle cx="70" cy="70" r="70" fill={`url(#${bloomId})`} />
+      <circle cx="70" cy="70" r="66" fill={`url(#${glowId})`} />
+      <circle cx="70" cy="70" r="50" fill={`url(#${bodyId})`} />
+    </svg>
+  );
+}
+
+function HeroMoon({ uid, className }: { uid: string; className?: string }) {
+  const glowId = `moon-glow-${uid}`;
+  const bodyId = `moon-body-${uid}`;
+  const shadeId = `moon-shade-${uid}`;
+
+  return (
+    <svg className={className} viewBox="0 0 120 120" fill="none" aria-hidden>
+      <defs>
+        <radialGradient id={glowId} cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#E8EEFF" stopOpacity="0.35" />
+          <stop offset="50%" stopColor="#C8D4EC" stopOpacity="0.1" />
+          <stop offset="100%" stopColor="#C8D4EC" stopOpacity="0" />
+        </radialGradient>
+        <radialGradient id={bodyId} cx="34%" cy="30%" r="68%">
+          <stop offset="0%" stopColor="#FAFCFF" />
+          <stop offset="45%" stopColor="#E8EDF6" />
+          <stop offset="85%" stopColor="#D0D8E8" />
+          <stop offset="100%" stopColor="#B8C2D4" />
+        </radialGradient>
+        <radialGradient id={shadeId} cx="72%" cy="68%" r="45%">
+          <stop offset="0%" stopColor="#9AA8BE" stopOpacity="0.35" />
+          <stop offset="100%" stopColor="#9AA8BE" stopOpacity="0" />
+        </radialGradient>
+        <filter id={`moon-bloom-${uid}`} x="-30%" y="-30%" width="160%" height="160%">
+          <feGaussianBlur stdDeviation="2" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <circle cx="60" cy="60" r="58" fill={`url(#${glowId})`} />
+      <circle cx="60" cy="60" r="44" fill={`url(#${bodyId})`} filter={`url(#moon-bloom-${uid})`} />
+      <circle cx="60" cy="60" r="44" fill={`url(#${shadeId})`} />
+      <circle cx="74" cy="52" r="6" fill="#C5CEDE" fillOpacity="0.25" />
+      <circle cx="50" cy="68" r="4" fill="#C5CEDE" fillOpacity="0.18" />
+    </svg>
+  );
+}
+
+function FarClouds({ opacity, uid }: { opacity: number; uid: string }) {
+  if (opacity < 0.05) return null;
+  const fillId = `far-cloud-${uid}`;
+  return (
+    <svg
+      className="emp-hero-far-clouds absolute inset-0 w-full h-full"
+      viewBox="0 0 200 120"
+      preserveAspectRatio="xMaxYMid slice"
+      fill="none"
+      aria-hidden
+      style={{ opacity }}
+    >
+      <defs>
+        <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#FFFFFF" stopOpacity="0.85" />
+          <stop offset="100%" stopColor="#FFFFFF" stopOpacity="0.5" />
+        </linearGradient>
+      </defs>
+      <ellipse cx="160" cy="28" rx="36" ry="14" fill={`url(#${fillId})`} />
+      <ellipse cx="130" cy="42" rx="28" ry="11" fill={`url(#${fillId})`} fillOpacity="0.7" />
+      <ellipse cx="175" cy="48" rx="22" ry="9" fill={`url(#${fillId})`} fillOpacity="0.55" />
+    </svg>
+  );
+}
+
+/** Premium time-driven weather illustration — right 35% of hero card only. */
+export function HeroMorningCover() {
+  const uid = useId().replace(/:/g, "");
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const tick = () => setNow(new Date());
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const scene = useMemo(() => getWeatherScene(now), [now]);
+
+  /** Continuous sub-second depth for a live 3D feel without jumping phase. */
+  const depthPulse = useMemo(() => {
+    const ms = now.getSeconds() + now.getMilliseconds() / 1000;
+    const wave = Math.sin((ms / 60) * Math.PI * 2);
+    return {
+      sunRotateY: wave * 8,
+      sunRotateX: Math.cos((ms / 60) * Math.PI * 2) * 4,
+      moonRotateY: -wave * 10,
+      moonRotateX: Math.sin((ms / 45) * Math.PI * 2) * 5,
+      z: 18 + wave * 6,
+    };
+  }, [now]);
+
+  return (
+    <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]" aria-hidden>
+      {/* Base — theme-aware */}
+      <div className="emp-hero-cover-base absolute inset-0 bg-card" />
+
+      {/* Soft card-wide wash — same technique as morning orange */}
+      <div
+        className="emp-hero-sky absolute inset-0 transition-[background] duration-[1200ms] ease-in-out"
+        style={{ background: scene.cardGradient }}
+      />
+
+      {/* Right-side atmospheric shade — radial, feathered, no hard box */}
+      <div
+        className="absolute inset-0 transition-[background] duration-[1200ms] ease-in-out"
+        style={{ background: scene.rightAtmosphere }}
+      />
+
+      {/* Celestial bloom — sun / moon glow */}
+      <div
+        className="absolute inset-0 transition-[background] duration-[1200ms] ease-in-out"
+        style={{
+          background: `radial-gradient(ellipse 72% 110% at 88% 44%, ${scene.sunGlow} 0%, transparent 74%)`,
+        }}
+      />
+
+      {/* Readability shield — keeps name & text fully clear */}
+      <div className="emp-hero-cover-shield absolute inset-0 bg-gradient-to-r from-card from-[0%] via-card via-[58%] via-card/95 via-[66%] via-card/50 via-[74%] to-transparent" />
+
+        {/* Celestial elements — right zone with CSS 3D stage */}
+      <div
+        className="absolute inset-y-0 right-0 w-[34%] min-w-[200px]"
+        style={{ perspective: "720px", perspectiveOrigin: "70% 40%" }}
+      >
+        <FarClouds opacity={scene.farCloudsOpacity} uid={uid} />
+
+        {/* Stars — behind moon, visible on dark night shade */}
+        <div
+          className="absolute inset-0 z-0 transition-opacity duration-[1200ms] ease-in-out"
+          style={{ opacity: scene.starsOpacity }}
+        >
+          {STAR_POSITIONS.map(([x, y], i) => (
+            <span
+              key={i}
+              className="emp-hero-star absolute rounded-full"
+              style={{
+                left: `${x}%`,
+                top: `${y}%`,
+                width: i % 4 === 0 ? 2.5 : i % 3 === 0 ? 2 : 1.5,
+                height: i % 4 === 0 ? 2.5 : i % 3 === 0 ? 2 : 1.5,
+                animationDelay: `${(i % 7) * 0.45}s`,
+                backgroundColor: i % 5 === 0 ? "#F0F4FF" : "#FFFFFF",
+                boxShadow: i % 4 === 0 ? "0 0 3px rgba(220,230,255,0.9)" : "0 0 1.5px rgba(255,255,255,0.7)",
+              }}
+            />
+          ))}
+          <span className="emp-hero-shooting-star absolute left-[20%] top-[12%] size-1 rounded-full bg-white shadow-[0_0_4px_rgba(255,255,255,0.9)]" />
+        </div>
+
+        <div className="absolute inset-0 z-[1] overflow-hidden">
+          {/* Sun — realtime 3D orbital motion */}
+          {scene.showSun ? (
+            <div
+              className="emp-hero-celestial emp-hero-celestial-3d absolute z-[1] w-[112px] sm:w-[128px] transition-[top,right,opacity,transform] duration-[1000ms] ease-linear"
+              style={{
+                top: `${scene.sunTop}%`,
+                right: `${scene.sunRight}%`,
+                opacity: scene.sunOpacity,
+                transform: `translateZ(${depthPulse.z}px) rotateY(${depthPulse.sunRotateY}deg) rotateX(${depthPulse.sunRotateX}deg)`,
+                transformStyle: "preserve-3d",
+              }}
+            >
+              <HeroSun uid={uid} className="emp-hero-sun-pulse w-full" />
+            </div>
+          ) : null}
+
+          {/* Moon — realtime 3D orbital motion */}
+          {scene.showMoon ? (
+            <div
+              className="emp-hero-celestial emp-hero-celestial-3d absolute z-[1] w-[100px] sm:w-[114px] transition-[top,right,opacity,transform] duration-[1000ms] ease-linear"
+              style={{
+                top: `${scene.moonTop}%`,
+                right: `${scene.moonRight}%`,
+                opacity: scene.moonOpacity,
+                transform: `translateZ(${depthPulse.z + 4}px) rotateY(${depthPulse.moonRotateY}deg) rotateX(${depthPulse.moonRotateX}deg)`,
+                transformStyle: "preserve-3d",
+              }}
+            >
+              <HeroMoon uid={uid} className="emp-hero-moon-glow w-full" />
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <style>{`
+        .emp-hero-sun-pulse {
+          animation: emp-hero-sun-pulse 8s ease-in-out infinite;
+          transform-style: preserve-3d;
+        }
+        .emp-hero-moon-glow {
+          animation: emp-hero-moon-glow 10s ease-in-out infinite;
+          transform-style: preserve-3d;
+        }
+        .emp-hero-far-clouds {
+          animation: emp-hero-far-drift 42s ease-in-out infinite alternate;
+        }
+        .emp-hero-star {
+          animation: emp-hero-twinkle 3.5s ease-in-out infinite;
+        }
+        .emp-hero-shooting-star {
+          animation: emp-hero-shoot 52s ease-in-out infinite;
+          opacity: 0;
+        }
+        @keyframes emp-hero-sun-pulse {
+          0%, 100% { opacity: 0.92; filter: brightness(1) drop-shadow(0 8px 18px rgba(255,180,40,0.28)); }
+          50% { opacity: 1; filter: brightness(1.08) drop-shadow(0 10px 24px rgba(255,200,60,0.38)); }
+        }
+        @keyframes emp-hero-moon-glow {
+          0%, 100% { opacity: 0.94; filter: brightness(1) drop-shadow(0 6px 16px rgba(160,180,230,0.35)); }
+          50% { opacity: 1; filter: brightness(1.1) drop-shadow(0 8px 22px rgba(180,200,255,0.45)); }
+        }
+        @keyframes emp-hero-far-drift {
+          0% { transform: translateX(0) translateZ(0); }
+          100% { transform: translateX(-14px) translateZ(6px); }
+        }
+        @keyframes emp-hero-twinkle {
+          0%, 100% { opacity: 0.45; transform: scale(1); }
+          50% { opacity: 1; transform: scale(1.2); }
+        }
+        @keyframes emp-hero-shoot {
+          0%, 94%, 100% { opacity: 0; transform: translate(0, 0); }
+          95% { opacity: 0.9; transform: translate(0, 0); }
+          97% { opacity: 0; transform: translate(48px, 28px); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .emp-hero-celestial,
+          .emp-hero-sky {
+            transition: none !important;
+          }
+          .emp-hero-sun-pulse,
+          .emp-hero-moon-glow,
+          .emp-hero-far-clouds,
+          .emp-hero-star,
+          .emp-hero-shooting-star {
+            animation: none !important;
+          }
+        }
+      `}</style>
+    </div>
+  );
+}

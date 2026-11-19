@@ -1,0 +1,105 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { cn } from "@/app/utils/cn";
+import type { EmpSidebarNavItem } from "./emp-portal-sidebar-navigation";
+import { isEmpNavItemActive } from "./emp-portal-sidebar-navigation";
+import {
+  fullPortalUrl,
+  popPortalNavHistory,
+} from "./emp-portal-nav-history";
+
+interface EmpNavLinkProps {
+  item: EmpSidebarNavItem;
+  pathname: string;
+  collapsed: boolean;
+  badgeCount?: number;
+}
+
+export function EmpNavLink({ item, pathname, collapsed, badgeCount = 0 }: EmpNavLinkProps) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const active = isEmpNavItemActive(item, pathname, searchParams);
+  const Icon = item.icon;
+  const showBadge = badgeCount > 0;
+
+  const content = (
+    <div
+      title={collapsed ? item.label : undefined}
+      className={cn(
+        "group relative flex h-[38px] items-center gap-2 transition-all duration-150",
+        collapsed ? "mx-1.5 justify-center rounded-[10px] px-0" : "pl-2.5 pr-2 py-2",
+        active
+          ? "border-l-[3px] border-primary bg-primary/10 font-semibold text-primary"
+          : "border-l-[3px] border-transparent text-muted-foreground hover:bg-muted hover:text-foreground",
+      )}
+    >
+      <span className="relative shrink-0">
+        <Icon
+          className={cn("size-[18px]", active ? "text-primary" : "text-muted-foreground group-hover:text-foreground")}
+          strokeWidth={1.75}
+        />
+        {collapsed && showBadge ? (
+          <span className="absolute -right-1.5 -top-1.5 flex size-3.5 items-center justify-center rounded-full bg-primary text-[8px] font-bold text-primary-foreground">
+            {badgeCount > 9 ? "9+" : badgeCount}
+          </span>
+        ) : null}
+      </span>
+      {!collapsed ? (
+        <>
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium leading-tight tracking-normal">{item.label}</span>
+          {showBadge ? (
+            <span className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-semibold leading-none text-primary-foreground">
+              {badgeCount > 99 ? "99+" : badgeCount}
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <Link
+      href={item.href}
+      onClick={(e) => {
+        if (!active) return;
+        const onThisHref =
+          pathname === item.href || pathname.startsWith(`${item.href}/`);
+        // Highlighted from a related page (member profile, regularisation) still
+        // opens this item's own page instead of stepping through history.
+        if (!onThisHref) return;
+        // My Company: always open the tile menu (never Gmail-style history pop).
+        if (
+          (item.moduleId === "company" || item.href === "/my-company") &&
+          pathname !== "/my-company"
+        ) {
+          return;
+        }
+        // Re-clicking the active sidebar item = step back within THIS section only
+        // (e.g. employee form → employee list). Never jumps to another sidebar section.
+        e.preventDefault();
+        const search = searchParams.toString();
+        const currentUrl = fullPortalUrl(pathname, search ? `?${search}` : "");
+        const backUrl = popPortalNavHistory(currentUrl, item.id);
+
+        // Close nested form/detail panels on the current page when URL does not change.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("sidebar-main-page-click", {
+              detail: { path: pathname },
+            }),
+          );
+        }
+
+        if (backUrl) {
+          router.push(backUrl);
+        } else {
+          router.refresh();
+        }
+      }}
+    >
+      {content}
+    </Link>
+  );
+}
