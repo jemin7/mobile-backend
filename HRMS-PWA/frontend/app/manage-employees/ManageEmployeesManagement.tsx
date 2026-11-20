@@ -1259,6 +1259,7 @@ const [filterLoading, setFilterLoading] = useState(false);
     noticePeriodDaysForTermination: "",
     allowRotatingShift: false,
     allowCreateTaskOnMobile: false,
+    enableAttBranchOnly: false,
     pwaShowLeaveBalance: true,
     pwaShowLoanAdvances: true,
     mobileAttendanceEnabled: false,
@@ -2471,6 +2472,7 @@ const addCombinedDevMap = () => {
       noticePeriodDaysForTermination: "",
       allowRotatingShift: false,
       allowCreateTaskOnMobile: false,
+      enableAttBranchOnly: false,
       pwaShowLeaveBalance: true,
       pwaShowLoanAdvances: true,
       mobileAttendanceEnabled: false,
@@ -3245,6 +3247,7 @@ const addCombinedDevMap = () => {
         noticePeriodDaysForTermination: formData.noticePeriodDaysForTermination || undefined,
         allowRotatingShift: formData.allowRotatingShift,
         allowCreateTaskOnMobile: formData.allowCreateTaskOnMobile,
+        enableAttBranchOnly: formData.enableAttBranchOnly,
         pwaShowLeaveBalance: formData.pwaShowLeaveBalance,
         pwaShowLoanAdvances: formData.pwaShowLoanAdvances,
         mobileAttendanceEnabled: formData.mobileAttendanceEnabled,
@@ -3685,6 +3688,7 @@ const addCombinedDevMap = () => {
       noticePeriodDaysForTermination: freshData.noticePeriodDaysForTermination ?? "",
       allowRotatingShift: freshData.allowRotatingShift ?? false,
       allowCreateTaskOnMobile: freshData.allowCreateTaskOnMobile ?? false,
+      enableAttBranchOnly: freshData.enableAttBranchOnly ?? false,
       pwaShowLeaveBalance: freshData.pwaShowLeaveBalance ?? true,
       pwaShowLoanAdvances: freshData.pwaShowLoanAdvances ?? true,
       mobileAttendanceEnabled: freshData.mobileAttendanceEnabled ?? false,
@@ -5955,7 +5959,7 @@ const handleCancel = () => {
                     onChange={(e) => setFormData((p) => ({ ...p, pwaShowLeaveBalance: e.target.checked }))}
                     className="rounded border-gray-300"
                   />
-                  <span className="text-sm text-gray-700">Show leave status bar</span>
+                  <span className="text-sm text-gray-700">Show Leave consumption status</span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -5964,7 +5968,7 @@ const handleCancel = () => {
                     onChange={(e) => setFormData((p) => ({ ...p, pwaShowLoanAdvances: e.target.checked }))}
                     className="rounded border-gray-300"
                   />
-                  <span className="text-sm text-gray-700">Show Loan & Advances in My Profile</span>
+                  <span className="text-sm text-gray-700">Allow apply for Loan & Advances</span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -5973,7 +5977,16 @@ const handleCancel = () => {
                     onChange={(e) => setFormData((p) => ({ ...p, allowCreateTaskOnMobile: e.target.checked }))}
                     className="rounded border-gray-300"
                   />
-                  <span className="text-sm text-gray-700">Allow employee to create tasks from mobile app</span>
+                  <span className="text-sm text-gray-700">Allow to create Task</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!formData.enableAttBranchOnly}
+                    onChange={(e) => setFormData((p) => ({ ...p, enableAttBranchOnly: e.target.checked }))}
+                    className="rounded border-gray-300"
+                  />
+                  <span className="text-sm text-gray-700">Enable Attendance from Branch Only</span>
                 </label>
               </div>
 

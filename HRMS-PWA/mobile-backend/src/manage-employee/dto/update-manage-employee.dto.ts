@@ -191,6 +191,11 @@ export class UpdateManageEmployeeDto {
   @Type(() => Boolean)
   allowCreateTaskOnMobile?: boolean;
 
+  
+    @IsOptional() @IsBoolean()
+    @Type(() => Boolean)
+    enableAttBranchOnly?: boolean;
+
   @IsOptional()
   @IsBoolean()
   @Type(() => Boolean)

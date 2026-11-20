@@ -412,6 +412,10 @@ export class AuthService {
     await this.moduleAccess.assertLoginAllowed(companyID, role);
   }
 
+  async assertMobileSessionAllowed(companyID?: number | null, role?: string | null) {
+    await this.moduleAccess.assertSessionAllowed(companyID, role);
+  }
+
   async validateUser(payload: any) {
     if (payload.type === 'user') {
       return await this.usersService.findOne(payload.sub);

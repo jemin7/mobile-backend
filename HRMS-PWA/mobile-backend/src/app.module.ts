@@ -83,6 +83,7 @@ import { EmployeePermissionsModule } from './employee-permissions/employee-permi
 import { CompanyPolicyModule } from './company-policy/company-policy.module';
 import { SystemSettingsModule } from './system-settings/system-settings.module';
 import { CompanyModuleAccessModule } from './common/company-module-access.module';
+import { MobileApiModule } from './mobile-api/mobile-api.module';
 
 
 @Module({
@@ -138,6 +139,7 @@ import { CompanyModuleAccessModule } from './common/company-module-access.module
     ReimbursementModule,
     UsersModule,
     AuthModule,
+    MobileApiModule,
     OvertimeModule,
     RosterModule,
     PfcomplianceModule,

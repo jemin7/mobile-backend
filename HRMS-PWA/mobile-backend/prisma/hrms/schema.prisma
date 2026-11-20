@@ -863,6 +863,7 @@ model ManageEmployee {
   salaryCycleID                      Int?
   allowRotatingShift                 Boolean                             @default(false)
   allowCreateTaskOnMobile            Boolean                             @default(false)
+  enableAttBranchOnly                Boolean                             @default(false)
   pwaShowLeaveBalance                Boolean                             @default(true)
   pwaShowLoanAdvances                Boolean                             @default(true)
   mobileAttendanceEnabled            Boolean                             @default(false)
@@ -937,6 +938,7 @@ model ManageEmployee {
   onboardingApprovalRequests         ApprovalRequest[]                   @relation("ApprovalRequestSubjectEmployee")
   approvalAssignments                ApprovalRequestApprover[]           @relation("ApprovalAssignedEmployee")
   approvalActions                    ApprovalRequestAction[]             @relation("ApprovalActionEmployee")
+mobileAuthSessions                 MobileAuthSession[]
 
   @@unique([employeeID, companyID], name: "unique_employee_id_per_company")
 }
@@ -1609,7 +1611,8 @@ model User {
   company           Company?         @relation(fields: [companyID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   contractors       Contractors?     @relation(fields: [contractorID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   profile           UserProfile?
-  userCompanies     UserCompany[]
+  userCompanies      UserCompany[]
+mobileAuthSessions MobileAuthSession[]
 }
 
 model UserCompany {
@@ -2035,6 +2038,8 @@ model AttendanceLocation {
   operatingSystem   String?        @db.VarChar(128)
   userAgent         String?        @db.Text
   photoUrl          String?        @db.VarChar(512)
+  clientEventId     String?        @db.VarChar(64)
+  referenceEventId  String?        @db.VarChar(64)
   fenceType         String?        @db.VarChar(16)
   fenceSiteId       Int?
   companyID         Int?
@@ -2048,6 +2053,8 @@ model AttendanceLocation {
   @@index([employeeId])
   @@index([checkinTime])
   @@index([checkType])
+  @@unique([employeeId, clientEventId])
+  @@index([referenceEventId])
   @@map("attendance_locations")
 }
 
@@ -3135,4 +3142,85 @@ model DashboardPreference {
 
   @@unique([companyId, actorType, actorId, dashboardType])
   @@index([companyId, dashboardType])
+}
+
+
+enum MobileAuthAccountType {
+  USER
+  EMPLOYEE
+}
+
+model MobileAuthSession {
+  id           String                @id @default(uuid()) @db.Uuid
+  accountType  MobileAuthAccountType
+  userID       Int?
+  employeeID   Int?
+
+  deviceName   String?  @db.VarChar(120)
+  deviceId     String?  @db.VarChar(255)
+  platform     String?  @db.VarChar(16)
+  ipAddress    String?  @db.VarChar(64)
+  userAgent    String?  @db.VarChar(512)
+
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  revokeReason String?   @db.VarChar(64)
+
+  user          User?               @relation(fields: [userID], references: [id], onDelete: Cascade)
+  employee      ManageEmployee?     @relation(fields: [employeeID], references: [id], onDelete: Cascade)
+  refreshTokens MobileRefreshToken[]
+
+  @@index([userID])
+  @@index([employeeID])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@map("mobile_auth_sessions")
+}
+
+model MobileRefreshToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  sessionID String   @db.Uuid
+  tokenHash String   @unique @db.VarChar(64)
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  session MobileAuthSession @relation(fields: [sessionID], references: [id], onDelete: Cascade)
+
+  @@index([sessionID, expiresAt])
+  @@index([expiresAt])
+  @@map("mobile_refresh_tokens")
+}
+
+
+model ReceiverOutbox {
+  id         BigInt   @id @default(autoincrement())
+  kind       String   @db.Text
+  dedupe_key String   @unique @db.Text
+  payload    Json
+  attempts   Int      @default(0)
+  last_error String?  @db.Text
+  created_at DateTime @default(now()) @db.Timestamp(6)
+  updated_at DateTime @default(now()) @db.Timestamp(6)
+
+  @@map("receiver_outbox")
+}
+
+model ReceiverImportedPunch {
+  external_id   BigInt   @id
+  raw_attlog_id Int?
+  imported_at   DateTime @default(now()) @db.Timestamp(6)
+
+  @@map("receiver_imported_punch")
+}
+
+model ReceiverSyncState {
+  key        String   @id @db.Text
+  value      String?  @db.Text
+  updated_at DateTime @default(now()) @db.Timestamp(6)
+
+  @@map("receiver_sync_state")
 }

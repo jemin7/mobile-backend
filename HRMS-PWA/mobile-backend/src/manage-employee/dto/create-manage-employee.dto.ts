@@ -363,6 +363,10 @@ export class CreateManageEmployeeDto {
 
   @IsOptional() @IsBoolean()
   @Type(() => Boolean)
+  enableAttBranchOnly?: boolean;
+
+  @IsOptional() @IsBoolean()
+  @Type(() => Boolean)
   pwaShowLeaveBalance?: boolean;
 
   @IsOptional() @IsBoolean()

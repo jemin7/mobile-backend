@@ -686,6 +686,11 @@ export class ManageEmployeeService {
           ...(scalars.allowCreateTaskOnMobile !== undefined
             ? { allowCreateTaskOnMobile: !!scalars.allowCreateTaskOnMobile }
             : {}),
+
+          ...(scalars.enableAttBranchOnly !== undefined
+            ? { enableAttBranchOnly: !!scalars.enableAttBranchOnly }
+            : {}),
+
           ...(scalars.pwaShowLeaveBalance !== undefined
             ? { pwaShowLeaveBalance: !!scalars.pwaShowLeaveBalance }
             : {}),
@@ -1182,6 +1187,9 @@ export class ManageEmployeeService {
             pwaShowLeaveBalance: true,
             pwaShowLoanAdvances: true,
             allowCreateTaskOnMobile: true,
+            enableAttBranchOnly: true,
+            photoPunchEnabled: true,
+            wfhAllowed: true,
           }
         },
         company: {
@@ -2257,6 +2265,9 @@ async findOne(id: number) {
           ...(scalars.noticePeriodDaysForTermination !== undefined ? { noticePeriodDaysForTermination: scalars.noticePeriodDaysForTermination } : {}),
             ...(scalars.allowCreateTaskOnMobile !== undefined
               ? { allowCreateTaskOnMobile: !!scalars.allowCreateTaskOnMobile }
+              : {}),
+            ...(scalars.enableAttBranchOnly !== undefined
+              ? { enableAttBranchOnly: !!scalars.enableAttBranchOnly }
               : {}),
             ...(scalars.pwaShowLeaveBalance !== undefined
               ? { pwaShowLeaveBalance: !!scalars.pwaShowLeaveBalance }

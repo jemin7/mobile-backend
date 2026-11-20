@@ -19,6 +19,6 @@ import { CompanyModuleAccessModule } from '../common/company-module-access.modul
   ],
   providers: [AuthService, JwtStrategy],
   controllers: [AuthController],
-  exports: [PassportModule, JwtModule, JwtStrategy],
+  exports: [PassportModule, JwtModule, JwtStrategy, AuthService],
 })
 export class AuthModule {}
