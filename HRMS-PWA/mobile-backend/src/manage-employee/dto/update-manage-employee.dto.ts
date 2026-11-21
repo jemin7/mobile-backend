@@ -112,10 +112,16 @@ export class UpdateManageEmployeeDto {
   @IsOptional() @IsString() joiningDate?: string | null;
   @IsOptional() @IsString() businessPhoneNo?: string | null;
   @IsOptional() @IsEmail() businessEmail?: string | null;
-  @IsOptional() @IsString() @IsExactMobileNumber() personalPhoneNo?: string | null;
+  @IsOptional() @IsString() @IsExactMobileNumber() personalPhoneNo?:
+    | string
+    | null;
   @IsOptional() @IsEmail() personalEmail?: string | null;
   @IsOptional() @IsString() emergancyContact?: string | null;
-  @IsOptional() @IsArray() emergencyContacts?: { name?: string; relation?: string; contactNo?: string }[];
+  @IsOptional() @IsArray() emergencyContacts?: {
+    name?: string;
+    relation?: string;
+    contactNo?: string;
+  }[];
 
   @IsOptional() @IsString() presentAddress?: string | null;
   @IsOptional() @IsString() permenantAddress?: string | null;
@@ -135,6 +141,7 @@ export class UpdateManageEmployeeDto {
   @IsOptional() @IsString() aadharNo?: string | null;
   @IsOptional() @IsString() panNo?: string | null;
   @IsOptional() @IsString() uanNo?: string | null;
+  @IsOptional() @IsString() cinNo?: string | null;
   @IsOptional() @IsString() esiNo?: string | null;
 
   // Basic position fields (stored directly on ManageEmployee)
@@ -191,10 +198,10 @@ export class UpdateManageEmployeeDto {
   @Type(() => Boolean)
   allowCreateTaskOnMobile?: boolean;
 
-  
-    @IsOptional() @IsBoolean()
-    @Type(() => Boolean)
-    enableAttBranchOnly?: boolean;
+  @IsOptional()
+  @IsBoolean()
+  @Type(() => Boolean)
+  enableAttBranchOnly?: boolean;
 
   @IsOptional()
   @IsBoolean()
@@ -257,45 +264,51 @@ export class UpdateManageEmployeeDto {
   refetchLocation?: boolean;
 
   // Nested arrays (upsert)
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EduUpdateDto)
   edu?: EduUpdateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => ExpUpdateDto)
   exp?: ExpUpdateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => DevMapUpdateDto)
   devices?: DevMapUpdateDto[];
 
-     @IsOptional() @IsArray()
-    @ValidateNested({ each: true })
-    @Type(() => TokenDeviceMapCreateDto)
-    tokenDevices?: TokenDeviceMapCreateDto[];
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TokenDeviceMapCreateDto)
+  tokenDevices?: TokenDeviceMapCreateDto[];
 
-  @IsOptional() @IsArray()
-@ValidateNested({ each: true })
-@Type(() => BankDetailsCreateDto)
-bankDetails?: BankDetailsCreateDto[];
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => BankDetailsCreateDto)
+  bankDetails?: BankDetailsCreateDto[];
 
-employeeDocuments?: EmployeeDocumentDto[];
+  employeeDocuments?: EmployeeDocumentDto[];
 
-@IsOptional() @IsArray()
-@ValidateNested({ each: true })
-@Type(() => EmpDesignationCreateDto)
-empDesignations?: EmpDesignationCreateDto[];
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => EmpDesignationCreateDto)
+  empDesignations?: EmpDesignationCreateDto[];
 
-@IsOptional() @IsArray()
-bankDetailsIdsToDelete?: number[];
+  @IsOptional()
+  @IsArray()
+  bankDetailsIdsToDelete?: number[];
 
-@IsOptional() @IsArray()
-empDesignationIdsToDelete?: number[];
-
-
+  @IsOptional()
+  @IsArray()
+  empDesignationIdsToDelete?: number[];
 
   // Promotion (1:1)
   @IsOptional()
@@ -304,42 +317,50 @@ empDesignationIdsToDelete?: number[];
   promotion?: PromotionUpdateDto;
 
   // Multi-value junction table arrays
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpBranchCreateDto)
   empBranches?: EmpBranchCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpDepartmentCreateDto)
   empDepartments?: EmpDepartmentCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpEmploymentTypeCreateDto)
   empEmploymentTypes?: EmpEmploymentTypeCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpEmploymentStatusCreateDto)
   empEmploymentStatuses?: EmpEmploymentStatusCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpWorkShiftCreateDto)
   empWorkShifts?: EmpWorkShiftCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpAttendancePolicyCreateDto)
   empAttendancePolicies?: EmpAttendancePolicyCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpLeavePolicyCreateDto)
   empLeavePolicies?: EmpLeavePolicyCreateDto[];
 
-  @IsOptional() @IsArray()
+  @IsOptional()
+  @IsArray()
   @ValidateNested({ each: true })
   @Type(() => EmpContractorCreateDto)
   empContractors?: EmpContractorCreateDto[];

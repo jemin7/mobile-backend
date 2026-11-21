@@ -18,6 +18,7 @@ type JoiningFormEmployee = {
   aadharNo?: string | null;
   panNo?: string | null;
   uanNo?: string | null;
+  cinNo?: string | null;
   esiNo?: string | null;
   pfNumber?: string | null;
   pfMemberStatus?: string | null;
@@ -28,15 +29,27 @@ type JoiningFormEmployee = {
   departments?: { departmentName?: string | null } | null;
   designations?: { designation?: string | null } | null;
   company?: { companyName?: string | null } | null;
-  monthlyPayGrade?: { grossSalary?: string | null; monthlyPayGradeName?: string | null } | null;
+  monthlyPayGrade?: {
+    grossSalary?: string | null;
+    monthlyPayGradeName?: string | null;
+  } | null;
   employeeBankDetails?: {
     bankName?: string | null;
     bankBranchName?: string | null;
     accNumber?: string | null;
     ifscCode?: string | null;
   }[];
-  empEduQualification?: { degree?: string | null; class?: string | null; instituteName?: string | null }[];
-  empProfExprience?: { orgName?: string | null; designation?: string | null; fromDate?: string | null; toDate?: string | null }[];
+  empEduQualification?: {
+    degree?: string | null;
+    class?: string | null;
+    instituteName?: string | null;
+  }[];
+  empProfExprience?: {
+    orgName?: string | null;
+    designation?: string | null;
+    fromDate?: string | null;
+    toDate?: string | null;
+  }[];
 };
 
 const PAGE_W = 595.28;
@@ -81,6 +94,7 @@ function previousOrg(emp: JoiningFormEmployee): string {
 function pfEsiLine(emp: JoiningFormEmployee): string {
   const parts: string[] = [];
   if (txt(emp.uanNo)) parts.push(`UAN: ${txt(emp.uanNo)}`);
+  if (txt(emp.cinNo)) parts.push(`CIN: ${txt(emp.cinNo)}`);
   if (txt(emp.pfNumber)) parts.push(`PF: ${txt(emp.pfNumber)}`);
   if (txt(emp.esiNo)) parts.push(`ESIC: ${txt(emp.esiNo)}`);
   if (txt(emp.pfMemberStatus)) parts.push(txt(emp.pfMemberStatus));

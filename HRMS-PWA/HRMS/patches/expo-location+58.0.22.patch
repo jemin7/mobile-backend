@@ -1,0 +1,33 @@
+diff --git a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
+index a838c79..5100c9d 100644
+--- a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
++++ b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
+@@ -104,7 +104,8 @@ internal class HeadingEventResponse(
+ internal class LocationResponse(
+   @Field var coords: LocationObjectCoords? = null,
+   @Field var timestamp: Double? = null,
+-  @Field var mocked: Boolean? = null
++  @Field var mocked: Boolean? = null,
++@Field var monotonicMs: Double? = null
+ ) : Record, Serializable {
+   constructor(location: Location) : this(
+     coords = LocationObjectCoords(location),
+@@ -114,7 +115,8 @@ internal class LocationResponse(
+     } else {
+       @Suppress("DEPRECATION") // When minSdkVersion is 31, this code will be removed and the above code will be used instead.
+       location.isFromMockProvider
+-    }
++    },
++    monotonicMs = location.elapsedRealtimeNanos / 1_000_000.0
+   )
+ 
+   internal fun toBundle() = Bundle().apply {
+@@ -129,7 +131,7 @@ internal class LocationResponse(
+ 
+   private fun BaseBundle.putLocationResponseFields() {
+     timestamp?.let { putDouble("timestamp", it) }
+-    mocked?.let { putBoolean("mocked", it) }
++    monotonicMs?.let { putDouble("monotonicMs", it) }
+   }
+ }
+ 

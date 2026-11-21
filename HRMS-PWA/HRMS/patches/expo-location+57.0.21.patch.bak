@@ -1,0 +1,47 @@
+diff --git a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationArguments.kt b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationArguments.kt
+index 594ba75..eace52f 100644
+--- a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationArguments.kt
++++ b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationArguments.kt
+@@ -43,10 +43,10 @@ internal open class LocationOptions(
+   @Field var timeInterval: Long? = null
+ ) : Record, Serializable {
+   constructor(map: Map<String, Any?>) : this(
+-    accuracy = map["accuracy"] as? Int ?: ACCURACY_BALANCED,
+-    distanceInterval = map["distanceInterval"] as? Int?,
++    accuracy = (map["accuracy"] as? Number)?.toInt() ?: ACCURACY_BALANCED,
++    distanceInterval = (map["distanceInterval"] as? Number)?.toInt(),
+     mayShowUserSettingsDialog = map["mayShowUserSettingsDialog"] as? Boolean? ?: true,
+-    timeInterval = map["timeInterval"] as? Long
++    timeInterval = (map["timeInterval"] as? Number)?.toLong()
+   )
+ }
+ 
+diff --git a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
+index fa836b1..4f42ea2 100644
+--- a/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
++++ b/node_modules/expo-location/android/src/main/java/expo/modules/location/records/LocationResults.kt
+@@ -104,12 +104,14 @@ internal class HeadingEventResponse(
+ internal class LocationResponse(
+   @Field var coords: LocationObjectCoords? = null,
+   @Field var timestamp: Double? = null,
+-  @Field var mocked: Boolean? = null
++@Field var mocked: Boolean? = null,
++@Field var monotonicMs: Double? = null
+ ) : Record, Serializable {
+   constructor(location: Location) : this(
+     coords = LocationObjectCoords(location),
+     timestamp = location.time.toDouble(),
+-    mocked = location.isFromMockProvider
++    mocked = location.isFromMockProvider,
++    monotonicMs = location.elapsedRealtimeNanos / 1_000_000.0
+   )
+ 
+   internal fun <BundleType : BaseBundle> toBundle(bundleTypeClass: Class<BundleType>): BundleType {
+@@ -122,6 +124,7 @@ internal class LocationResponse(
+     return bundle.apply {
+       timestamp?.let { putDouble("timestamp", it) }
+       mocked?.let { putBoolean("mocked", it) }
++      monotonicMs?.let { putDouble("monotonicMs", it) }
+       if (bundle is PersistableBundle) {
+         (this as PersistableBundle).putPersistableBundle("coords", coords?.toBundle(PersistableBundle::class.java))
+       } else if (bundle is Bundle) {
